@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: spotiflac_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - spotiflac_net
+
+  backend:
+    build: .
+    image: spotiflac-backend:latest
+    container_name: spotiflac_backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DEBUG_HTML_DIR: /app/debug_html          # <- передаём в контейнер путь для дампов
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./debug_html:/app/debug_html           # <- монтируем локальную папку в API
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: uvicorn spotiflac_backend.main:app --host 0.0.0.0 --port 8000
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    networks:
+      - spotiflac_net
+
+volumes:
+  redis_data:
+
+networks:
+  spotiflac_net:
+    driver: bridge
+
+
