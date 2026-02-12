@@ -1,4 +1,4 @@
-﻿# SpotiFlac Backend
+﻿# FlacTor Backend
 
 Серверный сервис на FastAPI для поиска музыкальных торрент-релизов и выдачи `.torrent` файлов клиентскому приложению.
 
@@ -103,3 +103,4 @@ poetry run uvicorn spotiflac_backend.main:app --host 0.0.0.0 --port 8000
 ```bash
 docker compose up --build
 ```
+
