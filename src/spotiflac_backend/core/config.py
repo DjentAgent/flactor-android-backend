@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     redis_enabled: bool = Field(default=True, alias="REDIS_ENABLED")
     redis_startup_retries: int = Field(default=8, alias="REDIS_STARTUP_RETRIES")
     redis_startup_retry_delay_sec: float = Field(default=1.0, alias="REDIS_STARTUP_RETRY_DELAY_SEC")
+    search_pb_soft_timeout_sec: float = Field(default=4.0, alias="SEARCH_PB_SOFT_TIMEOUT_SEC")
 
     # RuTracker
     rutracker_login: Optional[str] = Field(default=None, alias="RUTRACKER_LOGIN")
@@ -85,10 +86,15 @@ class Settings(BaseSettings):
     spotify_http_proxy: Optional[str] = Field(default=None, alias="SPOTIFY_HTTP_PROXY")
 
     # PirateBay
+    piratebay_api_base: str = Field(default="https://apibay.org", alias="PIRATEBAY_API_BASE")
     piratebay_track_filecheck_top_n: int = Field(default=12, alias="PIRATEBAY_TRACK_FILECHECK_TOP_N")
     piratebay_track_verify_timeout_sec: float = Field(default=3.0, alias="PIRATEBAY_TRACK_VERIFY_TIMEOUT_SEC")
     piratebay_min_seeders: int = Field(default=1, alias="PIRATEBAY_MIN_SEEDERS")
+    piratebay_extra_api_mirrors: Optional[str] = Field(default=None, alias="PIRATEBAY_EXTRA_API_MIRRORS")
+    piratebay_extra_page_mirrors: Optional[str] = Field(default=None, alias="PIRATEBAY_EXTRA_PAGE_MIRRORS")
     piratebay_extra_torrent_mirrors: Optional[str] = Field(default=None, alias="PIRATEBAY_EXTRA_TORRENT_MIRRORS")
+    piratebay_magnet_fallback_timeout_sec: float = Field(default=45.0, alias="PIRATEBAY_MAGNET_FALLBACK_TIMEOUT_SEC")
+    piratebay_magnet_tool_path: str = Field(default="aria2c", alias="PIRATEBAY_MAGNET_TOOL_PATH")
 
 
 settings = Settings()

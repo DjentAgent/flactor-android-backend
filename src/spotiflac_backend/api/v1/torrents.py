@@ -1,9 +1,10 @@
 import io
 import logging
 import re
+import time
 import urllib.parse
 from enum import Enum
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -21,6 +22,9 @@ from spotiflac_backend.services.usecases.torrent_search import TorrentSearchUseC
 log = logging.getLogger(__name__)
 router = APIRouter(prefix="")
 CAPTCHA_REQUIRED = 428
+DEBUG_RUTRACKER_ENDPOINT_VERSION = "rt-debug-http-2026-02-24-03"
+DEBUG_PIRATEBAY_SEARCH_ENDPOINT_VERSION = "pb-debug-http-2026-02-24-02"
+DEBUG_UNIFIED_SEARCH_ENDPOINT_VERSION = "search-debug-http-2026-02-24-02"
 
 
 class TorrentInfoResponse(BaseModel):
@@ -309,11 +313,11 @@ async def search_piratebay(
     summary="Debug PirateBay download pipeline",
 )
 async def debug_piratebay_download(
-    topic_id: str,
+    topic_id: int,
 ):
     pb_svc = get_piratebay_service()
     try:
-        return await pb_svc.diagnose_download_by_id(topic_id)
+        return await pb_svc.diagnose_download_by_id(str(topic_id))
     except HTTPException:
         raise
     except Exception as e:
@@ -336,7 +340,7 @@ async def debug_rutracker_search(
 ):
     rt_svc = get_rutracker_service()
     try:
-        return await rt_svc.debug_search_probe(
+        rt_payload = await rt_svc.debug_search_probe(
             query=q,
             only_lossless=lossless,
             track=track,
@@ -345,6 +349,8 @@ async def debug_rutracker_search(
             verify_track=verify_track,
             verify_top_n=verify_top_n,
         )
+        rt_payload["endpoint_version"] = DEBUG_RUTRACKER_ENDPOINT_VERSION
+        return rt_payload
     except CaptchaRequired as c:
         raise HTTPException(
             status_code=CAPTCHA_REQUIRED,
@@ -354,6 +360,243 @@ async def debug_rutracker_search(
         raise
     except Exception as e:
         log.error("RuTracker debug search error: %s", e)
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+def _as_search_item(
+    *,
+    title: str,
+    url: str,
+    size: str,
+    seeders: int,
+    leechers: int,
+    source: str,
+) -> Dict[str, Any]:
+    return {
+        "title": title or "",
+        "url": url or "",
+        "size": size or "",
+        "seeders": int(seeders or 0),
+        "leechers": int(leechers or 0),
+        "source": source,
+    }
+
+
+async def _run_piratebay_search_probe(
+    pb_svc,
+    *,
+    query: str,
+    only_lossless: Optional[bool],
+    track: Optional[str],
+    enabled: bool = True,
+) -> tuple[list, Dict[str, Any]]:
+    pb_probe: Dict[str, Any] = {
+        "enabled": bool(enabled),
+        "ok": False,
+        "duration_ms": 0,
+        "error": "",
+        "items_count": 0,
+        "items_sample": [],
+    }
+    if not enabled:
+        return [], pb_probe
+
+    pb_started = time.time()
+    try:
+        pb_items = await pb_svc.search(query, only_lossless=only_lossless, track=track)
+        pb_probe.update(
+            {
+                "ok": True,
+                "duration_ms": int((time.time() - pb_started) * 1000),
+                "items_count": len(pb_items),
+                "items_sample": [
+                    _as_search_item(
+                        title=x.title,
+                        url=x.url,
+                        size=x.size,
+                        seeders=x.seeders,
+                        leechers=x.leechers,
+                        source="piratebay",
+                    )
+                    for x in pb_items[: min(8, len(pb_items))]
+                ],
+            }
+        )
+        return pb_items, pb_probe
+    except HTTPException as e:
+        pb_probe.update(
+            {
+                "ok": False,
+                "duration_ms": int((time.time() - pb_started) * 1000),
+                "error": f"{e.status_code}: {e.detail}",
+            }
+        )
+        return [], pb_probe
+    except Exception as e:
+        pb_probe.update(
+            {
+                "ok": False,
+                "duration_ms": int((time.time() - pb_started) * 1000),
+                "error": str(e),
+            }
+        )
+        return [], pb_probe
+
+
+@router.get(
+    "/debug/search/piratebay",
+    summary="Debug PirateBay search pipeline",
+)
+async def debug_piratebay_search(
+    q: str = Query(..., title="Search query", min_length=1, max_length=200),
+    lossless: Optional[bool] = Query(None, title="Only lossless"),
+    track: Optional[str] = Query(None, title="Track name", max_length=100),
+    limit: int = Query(50, ge=1, le=200, description="Max PB items to include in response"),
+):
+    pb_svc = get_piratebay_service()
+    started = time.time()
+    try:
+        pb_items, pb_probe = await _run_piratebay_search_probe(
+            pb_svc,
+            query=q,
+            only_lossless=lossless,
+            track=track,
+            enabled=True,
+        )
+        pb_only_items = [
+            _as_search_item(
+                title=x.title,
+                url=x.url,
+                size=x.size,
+                seeders=x.seeders,
+                leechers=x.leechers,
+                source="piratebay",
+            )
+            for x in pb_items
+        ]
+        pb_only_items.sort(key=lambda x: x["seeders"], reverse=True)
+        pb_only_items = pb_only_items[: max(1, int(limit))]
+        return {
+            "endpoint_version": DEBUG_PIRATEBAY_SEARCH_ENDPOINT_VERSION,
+            "query": q,
+            "only_lossless": lossless,
+            "track": track,
+            "mode": "piratebay_only",
+            "duration_ms": int((time.time() - started) * 1000),
+            "limit": int(limit),
+            "search_like_final_count": len(pb_only_items),
+            "search_like_source_counts": {"rutracker": 0, "piratebay": len(pb_only_items)},
+            "search_like_final_items": pb_only_items,
+            "piratebay_probe": pb_probe,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("PirateBay debug search error: %s", e)
+        raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.get(
+    "/debug/search",
+    summary="Unified debug search (RuTracker + PirateBay, merged like /search)",
+)
+async def debug_unified_search(
+    q: str = Query(..., title="Search query", min_length=1, max_length=200),
+    lossless: Optional[bool] = Query(None, title="Only lossless"),
+    track: Optional[str] = Query(None, title="Track name", max_length=100),
+    pages: int = Query(2, ge=1, le=20, description="How many RuTracker pages to inspect"),
+    save_html: bool = Query(False, description="Dump RuTracker raw HTML pages into debug_html dir"),
+    verify_track: bool = Query(False, description="Verify RuTracker track hit by checking filelists"),
+    verify_top_n: int = Query(5, ge=1, le=100, description="How many top RuTracker torrents to verify"),
+    include_pb: bool = Query(True, description="Include PirateBay in merged debug output"),
+    merged_limit: int = Query(50, ge=1, le=200, description="Max merged items to include in response"),
+):
+    rt_svc = get_rutracker_service()
+    pb_svc = get_piratebay_service()
+    started = time.time()
+    try:
+        rt_started = time.time()
+        rt_payload = await rt_svc.debug_search_probe(
+            query=q,
+            only_lossless=lossless,
+            track=track,
+            max_pages=pages,
+            save_html=save_html,
+            verify_track=verify_track,
+            verify_top_n=verify_top_n,
+        )
+        rt_payload["endpoint_version"] = DEBUG_RUTRACKER_ENDPOINT_VERSION
+        rt_probe = {
+            "ok": True,
+            "duration_ms": int((time.time() - rt_started) * 1000),
+            "error": "",
+            "pipeline_final_count": int(rt_payload.get("pipeline_final_count") or 0),
+        }
+
+        pb_items, pb_probe = await _run_piratebay_search_probe(
+            pb_svc,
+            query=q,
+            only_lossless=lossless,
+            track=track,
+            enabled=include_pb,
+        )
+
+        rt_items = [
+            _as_search_item(
+                title=x.get("title", ""),
+                url=x.get("url", ""),
+                size=x.get("size", ""),
+                seeders=int(x.get("seeders", 0) or 0),
+                leechers=int(x.get("leechers", 0) or 0),
+                source="rutracker",
+            )
+            for x in (rt_payload.get("pipeline_final_items") or [])
+        ]
+        merged_items = list(rt_items)
+        merged_items.extend(
+            _as_search_item(
+                title=x.title,
+                url=x.url,
+                size=x.size,
+                seeders=x.seeders,
+                leechers=x.leechers,
+                source="piratebay",
+            )
+            for x in pb_items
+        )
+        merged_items.sort(key=lambda x: x["seeders"], reverse=True)
+        merged_items = merged_items[: max(1, int(merged_limit))]
+
+        source_counts = {"rutracker": 0, "piratebay": 0}
+        for x in merged_items:
+            src = str(x.get("source") or "")
+            if src in source_counts:
+                source_counts[src] += 1
+
+        return {
+            "endpoint_version": DEBUG_UNIFIED_SEARCH_ENDPOINT_VERSION,
+            "query": q,
+            "only_lossless": lossless,
+            "track": track,
+            "mode": "rutracker+piratebay" if include_pb else "rutracker_only",
+            "combined_duration_ms": int((time.time() - started) * 1000),
+            "merged_limit": int(merged_limit),
+            "search_like_final_count": len(merged_items),
+            "search_like_source_counts": source_counts,
+            "search_like_final_items": merged_items,
+            "rutracker_probe": rt_probe,
+            "piratebay_probe": pb_probe,
+            "rutracker_debug": rt_payload,
+        }
+    except CaptchaRequired as c:
+        raise HTTPException(
+            status_code=CAPTCHA_REQUIRED,
+            detail={"session_id": c.session_id, "captcha_image": c.img_url},
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("Unified debug search error: %s", e)
         raise HTTPException(status_code=502, detail=str(e))
 
 

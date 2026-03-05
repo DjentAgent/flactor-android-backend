@@ -1,106 +1,96 @@
-﻿# FlacTor Backend
+﻿ # FlacTor Backend
 
-Серверный сервис на FastAPI для поиска музыкальных торрент-релизов и выдачи `.torrent` файлов клиентскому приложению.
+  FlacTor Backend — FastAPI-сервис, который агрегирует поиск музыкальных torrent-раздач, работает с RuTracker через веб-
+  интерфейс (HTML + cookies + сессии) и предоставляет стабильный API для поиска и загрузки `.torrent`.
 
-## Кратко о проекте
+  ## Назначение
 
-- Агрегация поиска из нескольких источников (`RuTracker`, `PirateBay`) через единый API.
-- Специализированный алгоритм поиска для RuTracker без публичного API.
-- Приоритет: точность поиска конкретного трека, устойчивость при сетевой нестабильности и прогнозируемое время ответа.
+  Сервис решает три ключевые задачи:
+  - единый API поверх нескольких источников (`RuTracker`, `PirateBay`);
+  - точный поиск конкретного трека (а не только релиза);
+  - устойчивость к нестабильности внешних сайтов и сессий.
 
-## Задачи, которые решает сервис
+  ## Что реализовано
 
-### 1. Работа с RuTracker без API
+  ### 1) Интеграция с RuTracker
+  - Web-login через `forum/login.php` с разбором скрытых полей и `form_token`.
+  - Валидация успешной авторизации по `bb_session`.
+  - Обработка CAPTCHA-флоу с возвратом `HTTP 428` (`session_id`, `captcha_image`).
+  - Поиск и скачивание через HTTP + HTML parsing.
 
-- Авторизация через веб-сценарий входа (`forum/login.php`) с парсингом скрытых полей формы и `form_token`.
-- Проверка успешного входа по cookie `bb_session`.
-- Обработка CAPTCHA сценариев и возврат `HTTP 428` с `session_id` и `captcha_image`.
-- Поисковые запросы и скачивание выполняются через HTTP с разбором HTML ответов.
+  ### 2) Сессии и мультиаккаунтинг
+  - Пул аккаунтов через `RUTRACKER_ACCOUNTS`.
+  - Изолированное состояние на аккаунт: HTTP session, cookies, lock, fail limiter, health-метрики.
+  - Сохранение cookie jar в Redis (`rutracker:cookiejar:*`) и восстановление при старте.
+  - Pre-login аккаунтов при запуске.
+  - Keep-alive сессий и auto-relogin при инвалидировании.
+  - Переключение между аккаунтами при ошибках.
 
-### 2. Управление сессиями и мультиаккаунтинг
+  ### 3) Точность поиска треков
+  - Два сценария: поиск по артисту и поиск по треку.
+  - Многоэтапный алгоритм поиска трека: `strict`, `relaxed_release`, `relaxed_filematch`, `relaxed_lossless`,
+  `artist_fallback`.
+  - Подтверждение трека по `filelist` релиза, а не только по заголовку темы.
+  - Ранжирование кандидатов по релевантности, формату и сидерам.
 
-- Поддержка пула аккаунтов (`RUTRACKER_ACCOUNTS`).
-- Для каждого аккаунта хранится изолированное состояние:
-- HTTP сессия
-- набор cookies
-- блокировка
-- ограничитель сбоев
-- метрики состояния
-- Cookie сессии сохраняются в Redis (`rutracker:cookiejar:*`) и восстанавливаются при старте.
-- Предварительный вход для всех аккаунтов при запуске сервиса.
-- Поддержание активности сессий через периодический запрос к `forum/tracker.php`.
-- При редиректе на `login.php` сессия инвалидируется и выполняется повторная авторизация.
-- Запросы распределяются между аккаунтами с учетом состояния, при ошибке выполняется переключение на следующий аккаунт.
+  ### 4) Производительность и отказоустойчивость
+  - Кэш поиска, `filelist` и проверки присутствия трека.
+  - Раздельные TTL для `presence hit` и `presence miss`.
+  - Ограничение времени фаз и числа кандидатов.
+  - Retry + fail limiter для внешних запросов.
+  - Fallback на in-memory режим при недоступности Redis.
 
-### 3. Точность поиска трека
+  ### 5) Диагностика и наблюдаемость
+  - Диагностический endpoint: `GET /api/v1/torrents/debug/rutracker/search`.
+  - Трассировка фаз, фильтрации, проверок `filelist`, финального ранжирования.
+  - Опциональные HTML-дампы для анализа изменений верстки источника.
 
-- Два режима поиска:
-- режим по артисту
-- режим по треку
-- В режиме по треку реализован фазный алгоритм:
-- `strict`
-- `relaxed_release`
-- `relaxed_filematch`
-- `relaxed_lossless`
-- `artist_fallback`
-- Наличие трека подтверждается по `filelist` релиза, а не только по заголовку темы.
-- Кандидаты ранжируются по качеству совпадения, формату и количеству сидов.
+  ## API
 
-### 4. Производительность и устойчивость
+  - `GET /api/v1/torrents/search`
+  - `GET /api/v1/torrents/search/piratebay`
+  - `GET /api/v1/torrents/download/{topic_id}`
+  - `POST /api/v1/torrents/login/initiate`
+  - `POST /api/v1/torrents/login/complete`
+  - `GET /api/v1/torrents/debug/rutracker/search`
+  - `GET /api/v1/spotify/search`
+  - `GET /api/v1/spotify/tracks/{track_id}`
+  - `GET /api/v1/health`
 
-- Кэширование поиска, `filelist` и результатов проверки трека.
-- Раздельные TTL для `track presence hit` и `track presence miss`.
-- Ограничение времени выполнения фаз и числа кандидатов на фазу.
-- Повторные попытки запросов и ограничитель сбоев для внешних вызовов.
-- Резервный режим хранения в памяти при недоступности Redis.
+  ## Архитектура
 
-### 5. Диагностика и наблюдаемость
+  - `src/spotiflac_backend/api/v1/` — REST endpoints.
+  - `src/spotiflac_backend/services/rutracker.py` — основной алгоритм RuTracker.
+  - `src/spotiflac_backend/services/pirate_bay_service.py` — интеграция PirateBay.
+  - `src/spotiflac_backend/services/usecases/torrent_search.py` — координация поиска и merge результатов.
+  - `src/spotiflac_backend/services/trackers/` — tracker contracts и adapters.
+  - `src/spotiflac_backend/core/config.py` — runtime-конфигурация.
 
-- Диагностический эндпоинт: `GET /api/v1/torrents/debug/rutracker/search`.
-- Трассировка фаз алгоритма, счетчиков фильтрации, статистики проверок `filelist` и итоговых кандидатов.
-- Опциональные HTML дампы для анализа изменений верстки источника.
+  ## Стек
 
-## API
+  - Python 3.10+
+  - FastAPI, Uvicorn
+  - requests, aiohttp, cloudscraper
+  - lxml, BeautifulSoup
+  - Redis
+  - Pydantic v2
+  - pytest
 
-- `GET /api/v1/torrents/search`
-- `GET /api/v1/torrents/search/piratebay`
-- `GET /api/v1/torrents/download/{topic_id}`
-- `POST /api/v1/torrents/login/initiate`
-- `POST /api/v1/torrents/login/complete`
-- `GET /api/v1/torrents/debug/rutracker/search`
-- `GET /api/v1/spotify/search`
-- `GET /api/v1/spotify/tracks/{track_id}`
-- `GET /api/v1/health`
+  ## Локальный запуск
 
-## Архитектура
+  ```bash
+  poetry install
+  poetry run uvicorn spotiflac_backend.main:app --host 0.0.0.0 --port 8000
 
-- `src/spotiflac_backend/api/v1/` — REST эндпоинты
-- `src/spotiflac_backend/services/rutracker.py` — основной алгоритм RuTracker
-- `src/spotiflac_backend/services/pirate_bay_service.py` — сервис PirateBay
-- `src/spotiflac_backend/services/usecases/torrent_search.py` — координация поиска и объединение результатов
-- `src/spotiflac_backend/services/trackers/` — контракты и адаптеры
-- `src/spotiflac_backend/core/config.py` — конфигурация времени выполнения
+  или через Docker:
 
-## Стек
+  docker compose up --build
 
-- Python 3.10+
-- FastAPI, Uvicorn
-- requests, aiohttp, cloudscraper
-- lxml, BeautifulSoup
-- Redis
-- Pydantic v2
-- pytest, pytest async
+  ## Связанный клиент
 
-## Запуск
+  Android-клиент: https://github.com/DjentAgent/flactor-android
 
-```bash
-poetry install
-poetry run uvicorn spotiflac_backend.main:app --host 0.0.0.0 --port 8000
-```
+  ## Disclaimer
 
-или
-
-```bash
-docker compose up --build
-```
-
+  Проект предоставлен в образовательных и исследовательских целях. Пользователь несет ответственность за соблюдение
+  законодательства своей юрисдикции.

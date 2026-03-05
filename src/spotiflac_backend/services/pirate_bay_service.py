@@ -2,6 +2,7 @@ import asyncio
 import base64
 import binascii
 import hashlib
+import html
 import json
 import logging
 import os
@@ -131,6 +132,18 @@ def _track_aliases(track: str) -> List[str]:
     return sorted([a for a in aliases if a], key=len, reverse=True)
 
 
+def _dedupe_preserve_order(values: List[str]) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for v in values:
+        key = (v or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
 class FastHTTPSession:
     """Быстрая HTTP сессия с минимальными настройками."""
 
@@ -179,11 +192,19 @@ class FastHTTPSession:
 
         return None
 
-    async def get_json_fast(self, url: str, params: dict = None) -> Optional[dict]:
+    async def get_json_fast(
+            self,
+            url: str,
+            params: dict = None,
+            *,
+            timeout_total: float = 9.0,
+            timeout_connect: float = 3.0,
+            timeout_read: float = 7.0,
+    ) -> Optional[Any]:
         """Быстрый GET для JSON API."""
         try:
             session = await self._ensure_session()
-            timeout = ClientTimeout(total=5, connect=2)
+            timeout = ClientTimeout(total=timeout_total, connect=timeout_connect, sock_read=timeout_read)
 
             async with session.get(url, params=params, timeout=timeout) as resp:
                 if resp.status == 200:
@@ -335,19 +356,28 @@ class PirateBayService:
                 if m:
                     self._fast_mirrors.append(m)
 
-        self._api_mirrors = [self.api_base, "https://apibay.org"]
+        self._api_mirrors = _dedupe_preserve_order(
+            [
+                self.api_base,
+                "https://apibay.org",
+            ]
+        )
         extra_api_mirrors = getattr(settings, "piratebay_extra_api_mirrors", None)
         if extra_api_mirrors:
             for mirror in str(extra_api_mirrors).split(","):
                 m = mirror.strip().rstrip("/")
                 if m:
                     self._api_mirrors.append(m)
+        self._api_mirrors = _dedupe_preserve_order(self._api_mirrors)
 
         self._page_mirrors = [
-            "https://thepiratebay.org/?t={ID}",
-            "https://thepiratebay.party/torrent/{ID}",
             "https://tpb.party/torrent/{ID}",
             "https://pirateproxy.live/torrent/{ID}",
+            "https://thepiratebay.party/torrent/{ID}",
+            "https://thepiratebay.org/?t={ID}",
+            "https://thepiratebay.party/description.php?id={ID}",
+            "https://tpb.party/description.php?id={ID}",
+            "https://pirateproxy.live/description.php?id={ID}",
         ]
         extra_page_mirrors = getattr(settings, "piratebay_extra_page_mirrors", None)
         if extra_page_mirrors:
@@ -355,6 +385,7 @@ class PirateBayService:
                 m = mirror.strip()
                 if m:
                     self._page_mirrors.append(m)
+        self._page_mirrors = _dedupe_preserve_order(self._page_mirrors)
 
         self._id_download_mirrors = [
             "https://thepiratebay.org/download/{ID}",
@@ -401,16 +432,15 @@ class PirateBayService:
             return [TorrentInfo(**d) for d in cached]
 
         # API запрос
-        url = f"{self.api_base}/q.php"
-        params = {"q": query, "cat": 100}
-
-        items = await self.http.get_json_fast(url, params)
+        items, api_reachable = await self._search_api_items(query)
+        page_reachable = False
         if not items:
-            alt_url = f"{self.api_base}/search.php"
-            items = await self.http.get_json_fast(alt_url, params)
-
+            items, page_reachable = await self._search_page_items(query)
         if not items:
-            raise HTTPException(status_code=502, detail="PirateBay API unavailable")
+            if not api_reachable and not page_reachable:
+                raise HTTPException(status_code=502, detail="PirateBay API unavailable")
+            await self._record_timing("search_empty", start_time)
+            return []
 
         self.metrics.api_calls += 1
 
@@ -423,6 +453,215 @@ class PirateBayService:
 
         await self._record_timing("search_api", start_time)
         return results
+
+    @staticmethod
+    def _safe_int(value: Any) -> int:
+        try:
+            return int(str(value).strip())
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _strip_html(value: str) -> str:
+        text = re.sub(r"<[^>]+>", " ", value or "")
+        text = html.unescape(text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    @staticmethod
+    def _size_to_bytes(value: Any) -> int:
+        if isinstance(value, (int, float)):
+            return max(0, int(value))
+        text = str(value or "").strip()
+        if not text:
+            return 0
+        if text.isdigit():
+            return max(0, int(text))
+        m = re.search(r"([0-9]+(?:[.,][0-9]+)?)\s*([KMGTPE]?i?B)", text, re.IGNORECASE)
+        if not m:
+            return 0
+        num = float(m.group(1).replace(",", "."))
+        unit = m.group(2).upper()
+        unit_map = {
+            "B": 1,
+            "KB": 1000,
+            "MB": 1000 ** 2,
+            "GB": 1000 ** 3,
+            "TB": 1000 ** 4,
+            "PB": 1000 ** 5,
+            "KIB": 1024,
+            "MIB": 1024 ** 2,
+            "GIB": 1024 ** 3,
+            "TIB": 1024 ** 4,
+            "PIB": 1024 ** 5,
+        }
+        mult = unit_map.get(unit, 1)
+        return max(0, int(num * mult))
+
+    def _normalize_search_items(self, payload: Any) -> List[dict]:
+        if isinstance(payload, dict):
+            for key in ("items", "results", "data", "torrents"):
+                nested = payload.get(key)
+                if isinstance(nested, list):
+                    payload = nested
+                    break
+            else:
+                payload = [payload]
+        if not isinstance(payload, list):
+            return []
+
+        out: List[dict] = []
+        for raw in payload:
+            if not isinstance(raw, dict):
+                continue
+            tid = str(
+                raw.get("id")
+                or raw.get("torrentid")
+                or raw.get("torrent_id")
+                or ""
+            ).strip()
+            if not tid.isdigit() or tid == "0":
+                continue
+
+            name = str(raw.get("name") or raw.get("title") or "").strip()
+            if not name or name.lower().startswith("no results"):
+                continue
+
+            item: Dict[str, Any] = {
+                "id": tid,
+                "name": name,
+                "seeders": max(
+                    0,
+                    self._safe_int(raw.get("seeders") or raw.get("seeds") or raw.get("seed")),
+                ),
+                "leechers": max(
+                    0,
+                    self._safe_int(raw.get("leechers") or raw.get("peers")),
+                ),
+                "size": max(0, self._size_to_bytes(raw.get("size") or raw.get("sz") or 0)),
+            }
+            ih_raw = raw.get("info_hash") or raw.get("infohash") or raw.get("hash") or ""
+            ih_norm = _hex_upper_from_btih(str(ih_raw))
+            if ih_norm:
+                item["info_hash"] = ih_norm
+            out.append(item)
+        return out
+
+    def _parse_search_rows_from_html(self, html_text: str) -> List[dict]:
+        out_by_id: Dict[str, dict] = {}
+        for m_row in re.finditer(r"<tr[^>]*>(.*?)</tr>", html_text or "", re.IGNORECASE | re.DOTALL):
+            row = m_row.group(1)
+            m_tid = re.search(r"/torrent/(\d+)", row, re.IGNORECASE)
+            if not m_tid:
+                m_tid = re.search(r"(?:description\.php\?id=|[?&]id=)(\d+)", row, re.IGNORECASE)
+            if not m_tid:
+                continue
+            tid = m_tid.group(1)
+
+            m_title = re.search(
+                r'class=["\']detName["\'][^>]*>.*?<a[^>]*>(.*?)</a>',
+                row,
+                re.IGNORECASE | re.DOTALL,
+            )
+            if not m_title:
+                m_title = re.search(r'class=["\']detLink["\'][^>]*>(.*?)</a>', row, re.IGNORECASE | re.DOTALL)
+            title = self._strip_html(m_title.group(1)) if m_title else ""
+            if not title:
+                m_slug = re.search(r"/torrent/\d+/([^\"'<>/]+)", row, re.IGNORECASE)
+                if m_slug:
+                    title = urllib.parse.unquote(m_slug.group(1)).replace("_", " ").strip()
+            if not title:
+                continue
+
+            right_nums = [
+                self._safe_int(x)
+                for x in re.findall(r'<td[^>]*align=["\']right["\'][^>]*>\s*(\d+)\s*</td>', row, re.IGNORECASE)
+            ]
+            seeders = right_nums[0] if len(right_nums) > 0 else 0
+            leechers = right_nums[1] if len(right_nums) > 1 else 0
+
+            size_bytes = 0
+            m_size = re.search(r"Size\s*([0-9]+(?:[.,][0-9]+)?)\s*([KMGTPE]?i?B)", row, re.IGNORECASE)
+            if m_size:
+                size_bytes = self._size_to_bytes(f"{m_size.group(1)} {m_size.group(2)}")
+            else:
+                row_text = self._strip_html(row)
+                m_size2 = re.search(r"([0-9]+(?:[.,][0-9]+)?)\s*([KMGTPE]?i?B)", row_text, re.IGNORECASE)
+                if m_size2:
+                    size_bytes = self._size_to_bytes(f"{m_size2.group(1)} {m_size2.group(2)}")
+
+            current = {
+                "id": tid,
+                "name": title,
+                "seeders": max(0, seeders),
+                "leechers": max(0, leechers),
+                "size": max(0, size_bytes),
+            }
+            prev = out_by_id.get(tid)
+            if not prev or current["seeders"] > int(prev.get("seeders", 0)):
+                out_by_id[tid] = current
+
+        out = list(out_by_id.values())
+        out.sort(key=lambda x: (int(x.get("seeders", 0)), int(x.get("size", 0))), reverse=True)
+        return out
+
+    async def _search_api_items(self, query: str) -> Tuple[List[dict], bool]:
+        params = {"q": query, "cat": 100}
+        reachable = False
+        for api_base in self._api_mirrors:
+            for ep in ("q.php",):
+                url = f"{api_base.rstrip('/')}/{ep}"
+                payload = await self.http.get_json_fast(
+                        url,
+                        params=params,
+                        timeout_total=6.0,
+                        timeout_connect=2.0,
+                        timeout_read=4.0,
+                    )
+                if payload is not None:
+                    reachable = True
+                items = self._normalize_search_items(payload)
+                if items:
+                    return items, True
+        return [], reachable
+
+    async def _search_page_items(self, query: str) -> Tuple[List[dict], bool]:
+        domains: List[str] = []
+        for tmpl in self._page_mirrors:
+            probe = tmpl.replace("{ID}", "1")
+            parsed = urlparse(probe)
+            if not parsed.scheme or not parsed.netloc:
+                continue
+            domains.append(f"{parsed.scheme}://{parsed.netloc}")
+        domains = _dedupe_preserve_order(domains)
+        if domains:
+            def _prio(base: str) -> int:
+                host = (urlparse(base).netloc or "").lower()
+                if host == "tpb.party":
+                    return 0
+                if host == "thepiratebay.party":
+                    return 1
+                if host == "pirateproxy.live":
+                    return 2
+                if host == "thepiratebay.org":
+                    return 9
+                return 5
+            domains = sorted(domains, key=_prio)
+
+        q_enc = urllib.parse.quote(query, safe="")
+        urls: List[str] = []
+        for base in domains:
+            urls.append(f"{base}/search/{q_enc}/1/99/100")
+
+        reachable = False
+        for url in urls:
+            html_data = await self.http.get_fast(url, timeout=4.0)
+            if not html_data:
+                continue
+            reachable = True
+            items = self._parse_search_rows_from_html(html_data.decode("utf-8", "ignore"))
+            if items:
+                return items, True
+        return [], reachable
 
     async def _process_search_results(
             self,
@@ -509,7 +748,16 @@ class PirateBayService:
                     if not t.done():
                         t.cancel()
 
-            filtered = verified
+            if verified:
+                filtered = verified
+            else:
+                # Fallback: keep title-matching candidates when filelist verification
+                # could not prove presence in time.
+                title_candidates = [it for it in candidates if _title_maybe_contains_track(it.get("name", ""), track)]
+                if title_candidates:
+                    filtered = title_candidates[:target_verified]
+                else:
+                    filtered = []
 
         # Результаты
         results: List[TorrentInfo] = []
@@ -539,11 +787,12 @@ class PirateBayService:
                 return cached
             return str(cached).lower() in {"1", "true", "yes"}
 
-        ok = await self._quick_track_check(torrent_id, track)
-        await self.cache.set_fast(key, ok, ex=7 * 24 * 3600)
+        ok, checked = await self._quick_track_check(torrent_id, track)
+        if checked:
+            await self.cache.set_fast(key, ok, ex=7 * 24 * 3600)
         return ok
 
-    async def _quick_track_check(self, torrent_id: str, track: str) -> bool:
+    async def _quick_track_check(self, torrent_id: str, track: str) -> Tuple[bool, bool]:
         """Quick check by title/filelist using cached or fetched torrent metadata."""
         try:
             cache_key = f"pb:fl:{torrent_id}"
@@ -551,7 +800,7 @@ class PirateBayService:
             if not filelist:
                 filelist = await self._fetch_and_cache_filelist(torrent_id)
             if not filelist:
-                return False
+                return False, False
 
             aliases = _track_aliases(track)
             for fname in filelist:
@@ -559,13 +808,14 @@ class PirateBayService:
                 fn_compact = _compact_text(fn)
                 for alias in aliases:
                     if alias in fn:
-                        return True
+                        return True, True
                     alias_compact = _compact_text(alias)
                     if alias_compact and alias_compact in fn_compact:
-                        return True
+                        return True, True
+            return False, True
         except Exception as e:
             log.debug("Quick track check failed for %s: %s", torrent_id, e)
-        return False
+        return False, False
 
     async def _extract_filelist_from_torrent_bytes(self, data: bytes) -> List[str]:
         try:
@@ -740,9 +990,20 @@ class PirateBayService:
 
                 for api_base in self._api_mirrors:
                     api_url = f"{api_base}/t.php"
-                    meta = await self.http.get_json_fast(api_url, {"id": tid})
+                    meta = await self.http.get_json_fast(
+                        api_url,
+                        {"id": tid},
+                        timeout_total=12.0,
+                        timeout_connect=4.0,
+                        timeout_read=9.0,
+                    )
                     if not meta:
-                        meta = await self.http.get_json_fast(f"{api_base}/t.php?id={tid}")
+                        meta = await self.http.get_json_fast(
+                            f"{api_base}/t.php?id={tid}",
+                            timeout_total=12.0,
+                            timeout_connect=4.0,
+                            timeout_read=9.0,
+                        )
                     if not meta:
                         continue
 
@@ -770,7 +1031,13 @@ class PirateBayService:
                 # Last fallback: try search APIs with numeric query and match exact id.
                 for api_base in self._api_mirrors:
                     for ep in ("q.php", "search.php"):
-                        items = await self.http.get_json_fast(f"{api_base}/{ep}", {"q": tid, "cat": 100})
+                        items = await self.http.get_json_fast(
+                            f"{api_base}/{ep}",
+                            {"q": tid, "cat": 100},
+                            timeout_total=12.0,
+                            timeout_connect=4.0,
+                            timeout_read=9.0,
+                        )
                         if not items or not isinstance(items, list):
                             continue
                         for it in items:
