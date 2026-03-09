@@ -57,7 +57,9 @@ _NON_AUDIO_HINT_RE = re.compile(
     re.I,
 )
 _GENERIC_ALBUM_HINT_RE = re.compile(
-    r"(?:\bgreatest\s+hits\b|\bhits\s+and\s+unreleased\b|\bkaraoke\b|\bthe\s+best\b)",
+    r"(?:\bgreatest\s+hits\b|\bhits\s+and\s+unreleased\b|\bkaraoke\b|\bthe\s+best\b|"
+    r"\bbest\s+of\b|\bcollection\b|\bdiscography\b|\banthology\b|\bessentials\b|"
+    r"\bcomplete\b|\bbox\s*set\b|\bcompilation\b|\brarities\b)",
     re.I,
 )
 _TRACK_QUERY_NOISE = {
@@ -75,6 +77,30 @@ _TRACK_QUERY_NOISE = {
     "radio",
     "intro",
     "outro",
+}
+_TRACK_SUFFIX_NOISE = {
+    "remaster",
+    "remastered",
+    "version",
+    "mono",
+    "stereo",
+    "instrumental",
+    "karaoke",
+    "acoustic",
+    "deluxe",
+    "anniversary",
+    "expanded",
+    "bonus",
+    "session",
+    "sessions",
+    "take",
+    "demo",
+    "explicit",
+    "clean",
+    "club",
+    "single",
+    "album",
+    "original",
 }
 
 DEFAULT_TIME_BUDGET_SEC = getattr(settings, "rutracker_time_budget_sec", 6.0)
@@ -150,8 +176,10 @@ def _track_aliases(track: str) -> List[str]:
     tr = _norm(track)
     if not tr:
         return []
+    tr_core = _normalize_track_query(tr)
     variants = {
         tr,
+        tr_core,
         re.sub(r"\bfeat\.?.*$", "", tr).strip(),
         re.sub(r"\s*\(.*?\)\s*$", "", tr).strip(),
         re.sub(r"\s*\[.*?\]\s*$", "", tr).strip(),
@@ -161,6 +189,143 @@ def _track_aliases(track: str) -> List[str]:
     aliases = [v for v in variants if v]
     aliases.sort(key=len, reverse=True)
     return aliases
+
+
+def _is_track_noise_token(tok: str) -> bool:
+    t = (tok or "").strip().lower()
+    if not t:
+        return True
+    if t in _TRACK_QUERY_NOISE or t in _TRACK_SUFFIX_NOISE:
+        return True
+    if re.fullmatch(r"(?:19|20)\d{2}", t):
+        return True
+    if re.fullmatch(r"v\d+", t):
+        return True
+    return False
+
+
+def _has_meaningful_track_token(text: str) -> bool:
+    for tok in _norm(text).split():
+        if len(tok) >= 3 and not _is_track_noise_token(tok):
+            return True
+    return False
+
+
+def _normalize_track_query(track: str) -> str:
+    n = _norm(track)
+    if not n:
+        return ""
+    tokens = [t for t in n.split() if t]
+    if not tokens:
+        return n
+
+    # Trim trailing decorative suffixes such as "2011 remastered version".
+    while tokens and _is_track_noise_token(tokens[-1]):
+        tokens.pop()
+    while tokens and re.fullmatch(r"\d{1,2}", tokens[-1]):
+        tokens.pop()
+
+    if not tokens:
+        return n
+    core = " ".join(tokens)
+    if not _has_meaningful_track_token(core):
+        return n
+    return core
+
+
+def _is_short_common_track(track: Optional[str]) -> bool:
+    toks = [t for t in _norm(track or "").split() if len(t) >= 2 and (not _is_track_noise_token(t))]
+    if len(toks) != 1:
+        return False
+    return len(toks[0]) <= 8
+
+
+def _sanitize_album_candidate_text(raw: str, track: Optional[str] = None) -> str:
+    cand = (raw or "").strip().strip('"\'' + "«»„“”")
+    cand = re.sub(r"\s+", " ", cand)
+    if not cand:
+        return ""
+    cand = _strip_brackets(cand)
+    cand = re.sub(r"\s+", " ", cand).strip(" -—–|,.;:/")
+    if not cand:
+        return ""
+
+    cand = re.split(
+        r"\s*,\s*(?:flac|mp3|aac|wav|ape|wv|alac|lossless|lossy|web|cd|vinyl|tracks?|image|cue)\b",
+        cand,
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip()
+    cand = re.sub(r"\s*[-—–]\s*(?:19|20)\d{2}\b.*$", "", cand).strip()
+    cand = re.sub(r"\b(?:19|20)\d{2}\b\s*$", "", cand).strip(" -—–|,.;:/")
+
+    n = _norm(cand)
+    if not n:
+        return ""
+    if re.fullmatch(r"(?:19|20)\d{2}", n):
+        return ""
+    if len(n) < 3 and not re.fullmatch(r"\d{1,3}", n):
+        return ""
+    tr = _norm(track or "")
+    if tr and (n == tr or n.startswith(tr + " ")):
+        return ""
+    return cand
+
+
+def _extract_album_candidate_from_title(title_text: str, artist_text: str, track: Optional[str] = None) -> str:
+    title_plain = re.sub(r"\s+", " ", _strip_brackets(title_text or "")).strip()
+    if not title_plain:
+        return ""
+    parts = [p.strip() for p in re.split(r"\s[-—–]\s", title_plain) if p and p.strip()]
+    if len(parts) < 2:
+        return ""
+
+    artist_norm = _norm(_strip_brackets(artist_text or ""))
+    artist_tokens = _artist_tokens(artist_text or "")
+
+    for idx in range(0, len(parts) - 1):
+        part_norm = _norm(parts[idx])
+        if not part_norm:
+            continue
+        match_artist = False
+        if artist_norm and (part_norm == artist_norm or artist_norm in part_norm):
+            match_artist = True
+        elif artist_tokens and all(t in part_norm for t in artist_tokens):
+            match_artist = True
+        elif len(artist_tokens) == 1 and _title_starts_with_single_token_artist(parts[idx], artist_tokens[0]):
+            match_artist = True
+        if not match_artist:
+            continue
+        cand = _sanitize_album_candidate_text(parts[idx + 1], track=track)
+        if cand:
+            return cand
+    return ""
+
+
+def _title_starts_with_single_token_artist(title_text: str, artist_token: str) -> bool:
+    if not title_text or not artist_token:
+        return False
+    # Accept canonical forms like:
+    #   "adele - 30", "(pop) [cd] radiohead - creep"
+    # and reject ambiguous cases like:
+    #   "robyn adele anderson - ..."
+    lead = (title_text or "").strip()
+    # Drop a few leading bracketed metadata blocks from raw title.
+    for _ in range(6):
+        m = re.match(r'^\s*(?:\([^)]{1,160}\)|\[[^\]]{1,160}\])\s*', lead)
+        if not m:
+            break
+        lead = lead[m.end() :]
+    tok = _norm(artist_token)
+    if not tok:
+        return False
+    m = re.match(rf'^\s*["\'«„“]?{re.escape(tok)}(?P<tail>.*)$', lead, flags=re.I)
+    if not m:
+        return False
+    tail = (m.group("tail") or "").lstrip()
+    if not tail:
+        return True
+    return tail[:1] in "-—–:/|"
 
 
 def _derive_artist_from_query(query: str, track: Optional[str]) -> str:
@@ -185,6 +350,39 @@ def _derive_artist_from_query(query: str, track: Optional[str]) -> str:
 
 
 def _sanitize_album_hints(albums: List[str]) -> List[str]:
+    preferred: List[str] = []
+    generic: List[str] = []
+    seen: set[str] = set()
+    for a in albums or []:
+        raw = (a or "").strip()
+        if not raw:
+            continue
+        n = _norm(raw)
+        if not n:
+            continue
+        if len(n) < 3 and not re.fullmatch(r"\d{1,3}", n):
+            continue
+        # Drop resolver hints that are clearly live-event records, not albums.
+        if re.search(r"\b(?:19|20)\d{2}[-‐‑–—./]\d{2}[-‐‑–—./]\d{2}\b", raw):
+            continue
+        if ":" in raw and re.search(r"\b(?:19|20)\d{2}\b", n):
+            continue
+        if re.search(r"\b(?:live|festival|tour|weekends|concert)\b", n) and re.search(r"\b(?:19|20)\d{2}\b", n):
+            continue
+        if n in seen:
+            continue
+        seen.add(n)
+        if _GENERIC_ALBUM_HINT_RE.search(n):
+            generic.append(raw)
+        else:
+            preferred.append(raw)
+    out = preferred + generic
+    return out[:3]
+
+
+def _refine_album_hints_for_track(albums: List[str], track: Optional[str]) -> List[str]:
+    tr = _normalize_track_query(track or "")
+    tr_norm = _norm(tr) if tr else ""
     out: List[str] = []
     seen: set[str] = set()
     for a in albums or []:
@@ -194,10 +392,21 @@ def _sanitize_album_hints(albums: List[str]) -> List[str]:
         n = _norm(raw)
         if not n:
             continue
-        if len(n) < 3:
+        if tr_norm and (n == tr_norm or n.startswith(tr_norm + " ")):
             continue
-        if _GENERIC_ALBUM_HINT_RE.search(n):
-            continue
+        if re.search(r"\b(?:19|20)\d{2}\b", n):
+            event_words = (
+                "glastonbury",
+                "coachella",
+                "festival",
+                "concert",
+                "tour",
+                "weekend",
+                "weekends",
+                "live",
+            )
+            if any(w in n for w in event_words):
+                continue
         if n in seen:
             continue
         seen.add(n)
@@ -248,9 +457,11 @@ def _edit_distance_within(a: str, b: str, limit: int) -> bool:
 
 
 def _build_typo_recovery_queries(artist: str, track: str) -> List[str]:
-    tr = (track or "").strip()
-    if not tr:
+    tr_raw = (track or "").strip()
+    if not tr_raw:
         return []
+    tr_norm = _norm(tr_raw)
+    tr = _normalize_track_query(tr_raw) or tr_norm
 
     def _collapse_repeats(token: str) -> str:
         return re.sub(r"(.)\1{1,}", r"\1", token or "")
@@ -277,7 +488,7 @@ def _build_typo_recovery_queries(artist: str, track: str) -> List[str]:
         return out_keys[:4]
 
     def _track_recovery_chunks(text: str) -> List[str]:
-        tokens = [t for t in _norm(text).split() if len(t) >= 3]
+        tokens = [t for t in _norm(text).split() if len(t) >= 3 and (not _is_track_noise_token(t))]
         if not tokens:
             return []
         out_chunks: List[str] = []
@@ -299,7 +510,7 @@ def _build_typo_recovery_queries(artist: str, track: str) -> List[str]:
                 continue
             for i in range(0, len(tokens) - n + 1):
                 seg = tokens[i : i + n]
-                if all(t in _TRACK_QUERY_NOISE for t in seg):
+                if all(_is_track_noise_token(t) for t in seg):
                     continue
                 phrase = " ".join(seg)
                 score = sum(len(t) for t in seg)
@@ -310,7 +521,7 @@ def _build_typo_recovery_queries(artist: str, track: str) -> List[str]:
             add_chunk(f'"{phrase}"')
             add_chunk(phrase)
 
-        strongest = [t for t in sorted(tokens, key=len, reverse=True) if t not in _TRACK_QUERY_NOISE]
+        strongest = [t for t in sorted(tokens, key=len, reverse=True) if not _is_track_noise_token(t)]
         for tok in strongest[:2]:
             add_chunk(tok)
 
@@ -352,10 +563,38 @@ def _build_typo_recovery_queries(artist: str, track: str) -> List[str]:
 
 
 def _normalized_text(resp: requests.Response) -> str:
-    try:
-        return resp.content.decode("cp1251", errors="ignore")
-    except Exception:
+    raw = resp.content or b""
+    if not raw:
         return resp.text or ""
+
+    enc_candidates: List[str] = []
+    ctype = str((resp.headers or {}).get("Content-Type") or "")
+    m = re.search(r"charset\s*=\s*([a-zA-Z0-9._-]+)", ctype, flags=re.I)
+    if m:
+        enc_candidates.append(m.group(1).strip().lower())
+    if resp.encoding:
+        enc_candidates.append(str(resp.encoding).strip().lower())
+    enc_candidates.extend(["utf-8", "cp1251", "windows-1251"])
+
+    seen: set[str] = set()
+    uniq: List[str] = []
+    for enc in enc_candidates:
+        if not enc or enc in seen:
+            continue
+        seen.add(enc)
+        uniq.append(enc)
+
+    for enc in uniq:
+        try:
+            return raw.decode(enc, errors="strict")
+        except Exception:
+            continue
+    for enc in uniq:
+        try:
+            return raw.decode(enc, errors="ignore")
+        except Exception:
+            continue
+    return resp.text or ""
 
 
 def _file_ext(path: str) -> str:
@@ -515,8 +754,8 @@ class RutrackerService:
         self._initialized = True
 
         self.base_url = (base_url or settings.rutracker_base).rstrip("/")
-        self.pipeline_version = "rt-track-pipeline-2026-02-24-03"
-        self.debug_probe_version = "rt-debug-probe-2026-02-24-02"
+        self.pipeline_version = "rt-track-pipeline-2026-03-08-27"
+        self.debug_probe_version = "rt-debug-probe-2026-03-08-26"
         self.instance_id = uuid.uuid4().hex[:12]
         self.started_at_utc = datetime.utcnow().isoformat() + "Z"
 
@@ -847,7 +1086,6 @@ class RutrackerService:
                 r = acc.scraper.get(url, params=params, allow_redirects=False, timeout=25)
             else:
                 r = acc.scraper.post(url, data=data, allow_redirects=False, timeout=25)
-        r.encoding = "cp1251"
 
         if r.status_code in (301, 302) and "login.php" in (r.headers.get("Location") or ""):
             acc.scraper.cookies.clear()
@@ -857,7 +1095,6 @@ class RutrackerService:
                 r = acc.scraper.get(url, params=params, timeout=25) if data is None else acc.scraper.post(
                     url, data=data, timeout=25
                 )
-            r.encoding = "cp1251"
             return r
 
         if r.status_code >= 500 or r.status_code in (429,):
@@ -872,7 +1109,6 @@ class RutrackerService:
                 r = acc.scraper.get(url, params=params, timeout=25) if data is None else acc.scraper.post(
                     url, data=data, timeout=25
                 )
-            r.encoding = "cp1251"
             r.raise_for_status()
         return r
 
@@ -926,7 +1162,6 @@ class RutrackerService:
         data = {"t": str(tid)}
         with acc.lock:
             r = acc.scraper.post(url, data=data, headers=headers, allow_redirects=True, timeout=25)
-        r.encoding = "cp1251"
         r.raise_for_status()
         body = _normalized_text(r)
         if not body.strip():
@@ -978,6 +1213,15 @@ class RutrackerService:
             return True
 
         title_norm = _norm(_strip_brackets(title_txt))
+        artist_tokens = _artist_tokens(artist)
+
+        # Single-token artists are very ambiguous ("Adele", "Seal", ...):
+        # require artist position near the title prefix to suppress false positives.
+        if len(artist_tokens) == 1:
+            if _title_starts_with_single_token_artist(title_txt, artist_tokens[0]):
+                return True
+            log.debug("Artist miss (single-token prefix): artist=%r title=%r forum=%r", artist, title_txt, forum_txt)
+            return False
 
         # РїРѕР»РЅРѕРµ РІС…РѕР¶РґРµРЅРёРµ С„СЂР°Р·С‹ Р°СЂС‚РёСЃС‚Р°
         if re.search(rf"(?<!\w){re.escape(artist)}(?!\w)", title_norm):
@@ -1010,6 +1254,12 @@ class RutrackerService:
         if not title_tokens:
             return False
 
+        if len(q_tokens) == 1:
+            qt = q_tokens[0]
+            if _title_starts_with_single_token_artist(title_txt, qt):
+                return True
+            return False
+
         matched = 0
         for qt in q_tokens:
             if qt in title_norm:
@@ -1030,6 +1280,62 @@ class RutrackerService:
             )
             return True
         return False
+
+    def _discover_album_hints_from_artist_rows(
+        self,
+        *,
+        artist_query: str,
+        track: str,
+        t0: float,
+        budget: float,
+        max_pages: int = 1,
+        max_rows: int = 120,
+        debug_info: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
+        rows, _ = self._perform_search_pages(
+            query=artist_query,
+            max_pages=max(1, int(max_pages)),
+            t0=t0,
+            budget=budget,
+            want_candidates=max(20, int(max_rows)),
+            artist_only=True,
+        )
+
+        filtered: List[Tuple[TorrentInfo, int, int, str, str]] = []
+        for ti, tid, forum_id, forum_txt, title_txt in rows:
+            if not self._artist_ok_soft(artist_query, forum_txt, title_txt):
+                continue
+            filtered.append((ti, tid, forum_id, forum_txt, title_txt))
+        filtered.sort(key=lambda x: x[0].seeders, reverse=True)
+
+        hints_raw: List[str] = []
+        seen: set[str] = set()
+        for ti, tid, forum_id, forum_txt, title_txt in filtered:
+            cand = _extract_album_candidate_from_title(title_txt, artist_query, track=track)
+            if not cand:
+                continue
+            nn = _norm(cand)
+            if not nn or nn in seen:
+                continue
+            seen.add(nn)
+            hints_raw.append(cand)
+            if len(hints_raw) >= 8:
+                break
+
+        hints = _refine_album_hints_for_track(_sanitize_album_hints(hints_raw), track)
+        if debug_info is not None:
+            try:
+                debug_info.update(
+                    {
+                        "artist_rows_total": len(rows),
+                        "artist_rows_after_prefilter": len(filtered),
+                        "album_hints_raw": hints_raw[:8],
+                        "album_hints_final": hints[:6],
+                    }
+                )
+            except Exception:
+                pass
+        return hints[:6]
 
     def _track_in_files(
         self,
@@ -1239,6 +1545,10 @@ class RutrackerService:
         log.debug("Search page 0: rows=%d (query=%r, total_hint=%s, artist_only=%s)", len(page0), query,
                   total_hint or "?", artist_only)
 
+        # No rows on page 0 means pagination won't help for this query form.
+        if not all_rows:
+            return all_rows, used_whitelist
+
         if len(all_rows) >= want_candidates or (time.time() - t0) >= budget:
             return all_rows, used_whitelist
 
@@ -1279,6 +1589,7 @@ class RutrackerService:
             relax_file_match: bool = False,
             soft_artist_match: bool = False,
             fuzzy_track_match: bool = False,
+            recheck_cached_miss_top_n: int = 0,
             debug_info: Optional[Dict[str, Any]] = None,
     ) -> List[TorrentInfo]:
         is_wide = ('"' not in query_str) and (' ' not in query_str or track is None)
@@ -1293,7 +1604,12 @@ class RutrackerService:
             if max_candidates_override is not None
             else (self.artist_max_candidates_per_pass if artist_only else self.track_max_candidates_per_pass)
         )
+        recheck_cached_miss_top_n = max(0, int(recheck_cached_miss_top_n or 0))
+        if recheck_cached_miss_top_n > max_candidates:
+            recheck_cached_miss_top_n = max_candidates
 
+        track_music_first = False
+        track_music_fallback_to_wide = False
         parsed_all, used_whitelist = self._perform_search_pages(
             query=query_str,
             max_pages=max_pages,
@@ -1349,40 +1665,48 @@ class RutrackerService:
                 artist_only=False,
             )
 
+        track_music_fallback_due_empty_prefilter = False
+        nonlocal_used_whitelist = used_whitelist
+
+        def _prefilter_rows(
+            rows: List[Tuple[TorrentInfo, int, int, str, str]]
+        ) -> Tuple[List[Tuple[TorrentInfo, int, int, str, str]], int, int, int, int]:
+            _skip_lossless = 0
+            _skip_release = 0
+            _skip_whitelist = 0
+            _skip_artist = 0
+            _items_pre: List[Tuple[TorrentInfo, int, int, str, str]] = []
+            for ti, tid, forum_id, forum_txt, title_txt in rows:
+                is_lossless = bool(_LOSSLESS_RE.search(ti.title))
+                is_lossy = bool(_LOSSY_RE.search(ti.title))
+                if only_lossless is True and (not is_lossless or is_lossy):
+                    _skip_lossless += 1
+                    continue
+                if only_lossless is False and is_lossless:
+                    _skip_lossless += 1
+                    continue
+                if track and strict_release_filter and _looks_non_audio_release(forum_txt, title_txt):
+                    _skip_release += 1
+                    continue
+                # If we searched with whitelist (f=...), avoid re-applying for artist-only.
+                if track is None and artist_only and (not nonlocal_used_whitelist) and forum_id not in MUSIC_FORUM_IDS:
+                    _skip_whitelist += 1
+                    continue
+                artist_match_ok = (
+                    self._artist_ok_soft(artist_filter, forum_txt, title_txt)
+                    if soft_artist_match
+                    else self._artist_ok(artist_filter, forum_txt, title_txt)
+                )
+                if not artist_match_ok:
+                    _skip_artist += 1
+                    continue
+                _items_pre.append((ti, tid, forum_id, forum_txt, title_txt))
+            return _items_pre, _skip_lossless, _skip_release, _skip_whitelist, _skip_artist
+
+        items_pre, skip_lossless, skip_release, skip_whitelist, skip_artist = _prefilter_rows(parsed_all)
+
         log.debug("Search rows found: %d (query=%r, lossless=%s, track=%r, total_hint=?)",
                   len(parsed_all), query_str, only_lossless, track)
-
-        skip_lossless = 0
-        skip_release = 0
-        skip_whitelist = 0
-        skip_artist = 0
-        items_pre: List[Tuple[TorrentInfo, int, int, str, str]] = []
-        for ti, tid, forum_id, forum_txt, title_txt in parsed_all:
-            is_lossless = bool(_LOSSLESS_RE.search(ti.title))
-            is_lossy = bool(_LOSSY_RE.search(ti.title))
-            if only_lossless is True and (not is_lossless or is_lossy):
-                skip_lossless += 1
-                continue
-            if only_lossless is False and is_lossless:
-                skip_lossless += 1
-                continue
-            if track and strict_release_filter and _looks_non_audio_release(forum_txt, title_txt):
-                skip_release += 1
-                continue
-            # Р•СЃР»Рё СѓР¶Рµ РёСЃРєР°Р»Рё СЃ whitelist (f=...), РїРѕРІС‚РѕСЂРЅРѕ РЅРµ СЂРµР¶РµРј
-            if track is None and artist_only and (not used_whitelist) and forum_id not in MUSIC_FORUM_IDS:
-                skip_whitelist += 1
-                continue
-            # РјР°С‚С‡ РїРѕ РїРѕР»РЅРѕР№ С„СЂР°Р·Рµ Р°СЂС‚РёСЃС‚Р°
-            artist_match_ok = (
-                self._artist_ok_soft(artist_filter, forum_txt, title_txt)
-                if soft_artist_match
-                else self._artist_ok(artist_filter, forum_txt, title_txt)
-            )
-            if not artist_match_ok:
-                skip_artist += 1
-                continue
-            items_pre.append((ti, tid, forum_id, forum_txt, title_txt))
 
         items_pre.sort(key=lambda x: x[0].seeders, reverse=True)
         if len(items_pre) > max_candidates:
@@ -1433,11 +1757,12 @@ class RutrackerService:
         filelist_checks_failed = 0
         filelist_track_hits = 0
         check_debug: List[Dict[str, Any]] = []
+        rechecked_cached_miss_tids: set[int] = set()
 
         max_workers = min(12, max(2, len(need_check)))
         futures = {}
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            for ti, tid, _, __, ___ in need_check:
+            for idx, (ti, tid, _, __, ___) in enumerate(need_check):
                 pres = self._get_track_presence(tid, track, allow_cached_miss=(not relax_file_match))
                 if pres is True:
                     track_presence_cache_true += 1
@@ -1460,19 +1785,26 @@ class RutrackerService:
                     continue
                 if pres is False:
                     track_presence_cache_false += 1
-                    if debug_info is not None and len(check_debug) < 24:
-                        check_debug.append(
-                            {
-                                "topic_id": tid,
-                                "title": ti.title,
-                                "seeders": ti.seeders,
-                                "from_presence_cache": True,
-                                "track_hit": False,
-                                "details": {"reason": "cached_miss"},
-                            }
-                        )
-                    continue
-                track_presence_cache_miss += 1
+                    should_recheck_cached_miss = (
+                        recheck_cached_miss_top_n > 0 and idx < recheck_cached_miss_top_n
+                    )
+                    if should_recheck_cached_miss:
+                        rechecked_cached_miss_tids.add(tid)
+                    else:
+                        if debug_info is not None and len(check_debug) < 24:
+                            check_debug.append(
+                                {
+                                    "topic_id": tid,
+                                    "title": ti.title,
+                                    "seeders": ti.seeders,
+                                    "from_presence_cache": True,
+                                    "track_hit": False,
+                                    "details": {"reason": "cached_miss"},
+                                }
+                            )
+                        continue
+                else:
+                    track_presence_cache_miss += 1
                 filelist_checks_started += 1
                 futures[ex.submit(self._get_filelist_for_account, tid, account)] = (ti, tid)
 
@@ -1489,7 +1821,12 @@ class RutrackerService:
                         relax_file_match=relax_file_match,
                         fuzzy_track_match=fuzzy_track_match,
                     )
-                    self._set_track_presence(tid, track, hit)
+                    if hit:
+                        self._set_track_presence(tid, track, True)
+                    else:
+                        # Don't cache "missing track" when filelist itself is unavailable/empty.
+                        if str(details.get("reason") or "") != "empty_filelist":
+                            self._set_track_presence(tid, track, False)
                     if not hit:
                         if debug_info is not None and len(check_debug) < 24:
                             check_debug.append(
@@ -1500,6 +1837,7 @@ class RutrackerService:
                                     "from_presence_cache": False,
                                     "track_hit": False,
                                     "file_count": len(files),
+                                    "rechecked_cached_miss": bool(tid in rechecked_cached_miss_tids),
                                     "details": details,
                                 }
                             )
@@ -1516,6 +1854,7 @@ class RutrackerService:
                                 "from_presence_cache": False,
                                 "track_hit": True,
                                 "file_count": len(files),
+                                "rechecked_cached_miss": bool(tid in rechecked_cached_miss_tids),
                                 "details": details,
                             }
                         )
@@ -1545,6 +1884,10 @@ class RutrackerService:
                     "used_forum_whitelist": bool(used_whitelist),
                     "soft_artist_match": bool(soft_artist_match),
                     "fuzzy_track_match": bool(fuzzy_track_match),
+                    "track_music_first": bool(track_music_first),
+                    "track_music_fallback_to_wide": bool(track_music_fallback_to_wide),
+                    "track_music_fallback_due_empty_prefilter": bool(track_music_fallback_due_empty_prefilter),
+                    "recheck_cached_miss_top_n": recheck_cached_miss_top_n,
                     "zero_rows_recall_used": bool(zero_rows_recall_used),
                     "zero_rows_recall_attempts": zero_rows_recall_attempts,
                     "track_presence_cache_true": track_presence_cache_true,
@@ -1643,8 +1986,11 @@ class RutrackerService:
             return items
 
         # --- track mode: aggressive precision/speed ---
+        track_raw = (track or "").strip()
+        track_core = _normalize_track_query(track_raw) if track_raw else ""
+        track = track_core or track_raw
         artist_base = _derive_artist_from_query(artist, track)
-        cache_key = f"search3:track:{artist}:{only_lossless}:{track}"
+        cache_key = f"search3:track:{artist}:{only_lossless}:{track_raw}"
         cached = self._cache_get_json(cache_key)
         if cached is not None:
             log.debug("Search cache hit: %r", cache_key)
@@ -1665,6 +2011,7 @@ class RutrackerService:
                     albums = [a for a in ([meta.primary_album] if getattr(meta, "primary_album", None) else []) +
                               ((getattr(meta, "albums", []) or [])) if a]
                     albums = _sanitize_album_hints(albums)
+                    albums = _refine_album_hints_for_track(albums, track)
                     conf = float(getattr(meta, "confidence", 0.0) or 0.0)
                 except Exception as e:
                     log.debug("Track resolver error (ignored): %s", e)
@@ -1673,11 +2020,18 @@ class RutrackerService:
 
             do_album_passes = bool(track) and conf >= 0.60 and bool(albums)
             typo_recovery_enabled = bool(track) and conf < 0.60
+            strict_album_limit_nohit = self.track_strict_album_limit_nohit if do_album_passes else None
+            if strict_album_limit_nohit is not None and strict_album_limit_nohit < 2 and only_lossless is True:
+                strict_album_limit_nohit = 2
             strict_budget = max(0.8, budget * (1.0 - self.track_relaxed_reserve_ratio))
             fallback_reserve_sec = max(0.6, min(1.5, budget * 0.2))
             non_fallback_budget = max(0.3, budget - fallback_reserve_sec)
             non_fallback_deadline = t0 + non_fallback_budget
             strict_deadline = min(t0 + strict_budget, non_fallback_deadline)
+            strict_track_rows_total = 0
+            strict_artist_prefilter = 0
+            skip_expensive_tail = False
+            single_token_artist = len(_artist_tokens(artist_base)) == 1
 
             def _merge_more(more: List[TorrentInfo]) -> int:
                 seen = {x.url for x in items}
@@ -1702,8 +2056,51 @@ class RutrackerService:
                 soft_artist_match: bool = False,
                 fuzzy_track_match: bool = False,
             ) -> None:
+                nonlocal strict_track_rows_total, strict_artist_prefilter
                 phase_budget = budget if deadline is None else max(0.1, deadline - t0)
+                track_max_pages_override = 1 if strict_release_filter else None
                 album_attempts = 0
+                artist_only_ran = False
+
+                if (
+                    single_token_artist
+                    and track
+                    and (not do_album_passes)
+                    and (time.time() - t0) < budget
+                    and len(items) < want
+                ):
+                    if deadline is not None and time.time() >= deadline:
+                        return
+                    q1 = f'"{artist_base}" "{track}"'
+                    log.debug(
+                        "track phase=%s artist-track-quoted query=%r strict_release=%s relax_file=%s",
+                        phase_name,
+                        q1,
+                        strict_release_filter,
+                        relax_file_match,
+                    )
+                    artist_track_q_dbg: Dict[str, Any] = {}
+                    more = self._get_current_account().cb.call(
+                        self._pass_once,
+                        q1,
+                        artist_base,
+                        phase_only_lossless,
+                        track,
+                        albums,
+                        t0,
+                        phase_budget,
+                        want,
+                        1,
+                        min(12, self.track_max_candidates_per_pass),
+                        strict_release_filter,
+                        relax_file_match,
+                        soft_artist_match,
+                        fuzzy_track_match,
+                        debug_info=artist_track_q_dbg,
+                    )
+                    if phase_name == "strict":
+                        strict_track_rows_total += int((artist_track_q_dbg or {}).get("rows_total") or 0)
+                    _merge_more(more)
 
                 if track and (time.time() - t0) < budget and len(items) < want:
                     if deadline is not None and time.time() >= deadline:
@@ -1716,6 +2113,7 @@ class RutrackerService:
                         strict_release_filter,
                         relax_file_match,
                     )
+                    track_q_dbg: Dict[str, Any] = {}
                     more = self._get_current_account().cb.call(
                         self._pass_once,
                         q3,
@@ -1726,13 +2124,16 @@ class RutrackerService:
                         t0,
                         phase_budget,
                         want,
-                        None,
+                        track_max_pages_override,
                         self.track_max_candidates_per_pass,
                         strict_release_filter,
                         relax_file_match,
                         soft_artist_match,
                         fuzzy_track_match,
+                        debug_info=track_q_dbg,
                     )
+                    if phase_name == "strict":
+                        strict_track_rows_total += int((track_q_dbg or {}).get("rows_total") or 0)
                     _merge_more(more)
 
                 if track and (time.time() - t0) < budget and len(items) < want:
@@ -1746,6 +2147,7 @@ class RutrackerService:
                         strict_release_filter,
                         relax_file_match,
                     )
+                    track_plain_dbg: Dict[str, Any] = {}
                     more = self._get_current_account().cb.call(
                         self._pass_once,
                         q2,
@@ -1756,18 +2158,38 @@ class RutrackerService:
                         t0,
                         phase_budget,
                         want,
-                        None,
+                        track_max_pages_override,
                         self.track_max_candidates_per_pass,
                         strict_release_filter,
                         relax_file_match,
                         soft_artist_match,
                         fuzzy_track_match,
+                        debug_info=track_plain_dbg,
                     )
+                    if phase_name == "strict":
+                        strict_track_rows_total += int((track_plain_dbg or {}).get("rows_total") or 0)
                     _merge_more(more)
 
-                if (time.time() - t0) < budget and len(items) < want:
+                if phase_only_lossless is False and (time.time() - t0) < budget and len(items) < want:
                     if deadline is not None and time.time() >= deadline:
                         return
+                    deep_lossy_artist_scan = bool(
+                        track
+                        and strict_release_filter
+                        and (not relax_file_match)
+                        and len(items) == 0
+                    )
+                    artist_pages_override = track_max_pages_override
+                    artist_candidates_override = self.track_max_candidates_per_pass
+                    artist_recheck_cached_miss_top_n = 0
+                    if deep_lossy_artist_scan:
+                        artist_pages_override = max(2, min(3, self.track_max_pages_wide))
+                        artist_candidates_override = min(80, max(60, self.track_max_candidates_per_pass * 2))
+                        artist_recheck_cached_miss_top_n = min(
+                            artist_candidates_override,
+                            max(12, self.track_max_candidates_per_pass),
+                        )
+                    artist_dbg: Dict[str, Any] = {}
                     more = self._get_current_account().cb.call(
                         self._pass_once,
                         artist_base,
@@ -1778,14 +2200,22 @@ class RutrackerService:
                         t0,
                         phase_budget,
                         want,
-                        None,
-                        self.track_max_candidates_per_pass,
+                        artist_pages_override,
+                        artist_candidates_override,
                         strict_release_filter,
                         relax_file_match,
                         soft_artist_match,
                         fuzzy_track_match,
+                        artist_recheck_cached_miss_top_n,
+                        debug_info=artist_dbg,
                     )
+                    if phase_name == "strict":
+                        strict_artist_prefilter = max(
+                            strict_artist_prefilter,
+                            int((artist_dbg or {}).get("rows_after_prefilter") or 0),
+                        )
                     _merge_more(more)
+                    artist_only_ran = True
 
                 if do_album_passes and (time.time() - t0) < budget and len(items) < want:
                     for alb in albums:
@@ -1808,6 +2238,7 @@ class RutrackerService:
                             strict_release_filter,
                             relax_file_match,
                         )
+                        album_q_dbg: Dict[str, Any] = {}
                         more = self._get_current_account().cb.call(
                             self._pass_once,
                             q,
@@ -1824,6 +2255,7 @@ class RutrackerService:
                             relax_file_match,
                             soft_artist_match,
                             fuzzy_track_match,
+                            debug_info=album_q_dbg,
                         )
                         _merge_more(more)
                         album_attempts += 1
@@ -1848,6 +2280,7 @@ class RutrackerService:
                             strict_release_filter,
                             relax_file_match,
                         )
+                        album_plain_dbg: Dict[str, Any] = {}
                         more = self._get_current_account().cb.call(
                             self._pass_once,
                             q,
@@ -1864,9 +2297,39 @@ class RutrackerService:
                             relax_file_match,
                             soft_artist_match,
                             fuzzy_track_match,
+                            debug_info=album_plain_dbg,
                         )
                         _merge_more(more)
                         album_attempts += 1
+
+                if (not artist_only_ran) and (time.time() - t0) < budget and len(items) < want:
+                    if deadline is not None and time.time() >= deadline:
+                        return
+                    artist_dbg: Dict[str, Any] = {}
+                    more = self._get_current_account().cb.call(
+                        self._pass_once,
+                        artist_base,
+                        artist_base,
+                        phase_only_lossless,
+                        track,
+                        albums,
+                        t0,
+                        phase_budget,
+                        want,
+                        None,
+                        self.track_max_candidates_per_pass,
+                        strict_release_filter,
+                        relax_file_match,
+                        soft_artist_match,
+                        fuzzy_track_match,
+                        debug_info=artist_dbg,
+                    )
+                    if phase_name == "strict":
+                        strict_artist_prefilter = max(
+                            strict_artist_prefilter,
+                            int((artist_dbg or {}).get("rows_after_prefilter") or 0),
+                        )
+                    _merge_more(more)
 
             _run_phase(
                 "strict",
@@ -1874,8 +2337,19 @@ class RutrackerService:
                 relax_file_match=False,
                 phase_only_lossless=only_lossless,
                 deadline=strict_deadline,
-                album_limit_if_nohit=self.track_strict_album_limit_nohit if do_album_passes else None,
+                album_limit_if_nohit=strict_album_limit_nohit,
             )
+            skip_expensive_tail = (
+                strict_track_rows_total == 0
+                and strict_artist_prefilter == 0
+                and (not do_album_passes)
+            )
+            if skip_expensive_tail:
+                log.debug(
+                    "track no-hit gating enabled: strict_track_rows_total=%d strict_artist_prefilter=%d",
+                    strict_track_rows_total,
+                    strict_artist_prefilter,
+                )
             if not items and typo_recovery_enabled and time.time() < non_fallback_deadline:
                 typo_budget = min(1.6, max(0.7, budget * 0.28))
                 typo_deadline = min(non_fallback_deadline, time.time() + typo_budget)
@@ -1903,7 +2377,205 @@ class RutrackerService:
                         True,
                     )
                     _merge_more(typo_more)
-            if not items:
+            if (
+                not items
+                and track_raw
+                and _norm(track_raw) != _norm(track)
+                and time.time() < non_fallback_deadline
+            ):
+                raw_phase_budget = max(0.4, min(1.2, non_fallback_deadline - time.time()))
+                raw_phase_t0 = time.time()
+                for rq in (f'{artist_base} "{track_raw}"', f"{artist_base} {track_raw}"):
+                    if len(items) >= want:
+                        break
+                    if time.time() >= non_fallback_deadline:
+                        break
+                    log.debug("track phase=raw_track_fallback query=%r", rq)
+                    raw_more = self._get_current_account().cb.call(
+                        self._pass_once,
+                        rq,
+                        artist_base,
+                        only_lossless,
+                        track,
+                        albums,
+                        raw_phase_t0,
+                        raw_phase_budget,
+                        want,
+                        1,
+                        min(12, self.track_max_candidates_per_pass),
+                        False,
+                        False,
+                        True,
+                        True,
+                    )
+                    _merge_more(raw_more)
+            if (
+                not items
+                and track
+                and strict_track_rows_total >= 8
+                and _is_short_common_track(track)
+                and only_lossless is not False
+                and time.time() < non_fallback_deadline
+            ):
+                deep_deadline = min(non_fallback_deadline, time.time() + 1.4)
+                deep_phase_budget = max(0.5, min(1.2, deep_deadline - time.time()))
+                deep_candidates = min(60, max(36, self.track_max_candidates_per_pass * 2))
+                deep_recheck = min(deep_candidates, max(12, self.track_max_candidates_per_pass))
+                deep_phase_t0 = time.time()
+                for dq in (f'{artist_base} "{track}"', f"{artist_base} {track}"):
+                    if len(items) >= want:
+                        break
+                    if time.time() >= deep_deadline:
+                        break
+                    log.debug("track phase=strict_deep_track query=%r max_candidates=%d", dq, deep_candidates)
+                    deep_more = self._get_current_account().cb.call(
+                        self._pass_once,
+                        dq,
+                        artist_base,
+                        only_lossless,
+                        track,
+                        albums,
+                        deep_phase_t0,
+                        deep_phase_budget,
+                        want,
+                        1,
+                        deep_candidates,
+                        True,
+                        False,
+                        False,
+                        False,
+                        deep_recheck,
+                    )
+                    _merge_more(deep_more)
+            rescue_time_limit = non_fallback_deadline if only_lossless is not False else (t0 + budget + 0.6)
+            if (
+                not items
+                and track
+                and strict_track_rows_total >= 6
+                and _is_short_common_track(track)
+                and len(_artist_tokens(artist_base)) <= 2
+                and time.time() < rescue_time_limit
+            ):
+                rescue_deadline = min(rescue_time_limit, time.time() + 1.8)
+                rescue_budget = max(0.7, min(1.6, rescue_deadline - time.time()))
+                rescue_t0 = time.time()
+                rescue_dbg: Dict[str, Any] = {}
+                rescue_hints = self._discover_album_hints_from_artist_rows(
+                    artist_query=artist_base,
+                    track=track,
+                    t0=rescue_t0,
+                    budget=rescue_budget,
+                    max_pages=1,
+                    max_rows=120,
+                    debug_info=rescue_dbg,
+                )
+                log.debug("track phase=artist_album_rescue hints=%r debug=%s", rescue_hints, rescue_dbg)
+                if rescue_hints:
+                    rescue_candidates = min(30, max(18, self.track_max_candidates_per_pass))
+                    rescue_recheck = min(rescue_candidates, max(10, self.track_max_candidates_per_pass))
+                    for alb in rescue_hints[:3]:
+                        if len(items) >= want or time.time() >= rescue_deadline:
+                            break
+                        album_ctx = [alb] + [a for a in albums if _norm(a) != _norm(alb)]
+                        for rq in (f'{artist_base} "{alb}"', f"{artist_base} {alb}"):
+                            if len(items) >= want or time.time() >= rescue_deadline:
+                                break
+                            log.debug("track phase=artist_album_rescue query=%r", rq)
+                            rescue_more = self._get_current_account().cb.call(
+                                self._pass_once,
+                                rq,
+                                artist_base,
+                                only_lossless,
+                                track,
+                                album_ctx,
+                                rescue_t0,
+                                rescue_budget,
+                                want,
+                                1,
+                                rescue_candidates,
+                                True,
+                                False,
+                                False,
+                                False,
+                                rescue_recheck,
+                            )
+                            _merge_more(rescue_more)
+            if (
+                not items
+                and track
+                and only_lossless is False
+                and do_album_passes
+                and time.time() < (t0 + budget + 0.9)
+            ):
+                lossy_deadline = min(t0 + budget + 0.9, time.time() + 1.6)
+                lossy_budget = max(0.6, min(1.4, lossy_deadline - time.time()))
+                lossy_t0 = time.time()
+                lossy_dbg: Dict[str, Any] = {}
+                lossy_hints = self._discover_album_hints_from_artist_rows(
+                    artist_query=artist_base,
+                    track=track,
+                    t0=lossy_t0,
+                    budget=lossy_budget,
+                    max_pages=2,
+                    max_rows=180,
+                    debug_info=lossy_dbg,
+                )
+                already_tried_albums: set[str] = set()
+                if strict_album_limit_nohit is not None and strict_album_limit_nohit > 0:
+                    for a in albums[:strict_album_limit_nohit]:
+                        an = _norm(a)
+                        if an:
+                            already_tried_albums.add(an)
+                album_pool: List[str] = []
+                seen_pool: set[str] = set()
+                for source in (lossy_hints, albums):
+                    for alb in source:
+                        an = _norm(alb)
+                        if not an or an in seen_pool or an in already_tried_albums:
+                            continue
+                        seen_pool.add(an)
+                        album_pool.append(alb)
+                        if len(album_pool) >= 6:
+                            break
+                    if len(album_pool) >= 6:
+                        break
+                log.debug(
+                    "track phase=lossy_album_deep pool=%r hints=%r debug=%s",
+                    album_pool[:6],
+                    (lossy_hints or [])[:6],
+                    lossy_dbg,
+                )
+                if album_pool:
+                    deep_candidates = min(48, max(30, self.track_max_candidates_per_pass * 2))
+                    deep_recheck = min(deep_candidates, max(12, self.track_max_candidates_per_pass))
+                    for alb in album_pool[:4]:
+                        if len(items) >= want or time.time() >= lossy_deadline:
+                            break
+                        album_ctx = [alb] + [a for a in albums if _norm(a) != _norm(alb)]
+                        for rq in (f'{artist_base} "{alb}"', f"{artist_base} {alb}"):
+                            if len(items) >= want or time.time() >= lossy_deadline:
+                                break
+                            log.debug("track phase=lossy_album_deep query=%r", rq)
+                            lossy_more = self._get_current_account().cb.call(
+                                self._pass_once,
+                                rq,
+                                artist_base,
+                                only_lossless,
+                                track,
+                                album_ctx,
+                                lossy_t0,
+                                lossy_budget,
+                                want,
+                                1,
+                                deep_candidates,
+                                True,
+                                False,
+                                False,
+                                False,
+                                deep_recheck,
+                            )
+                            _merge_more(lossy_more)
+            if (not items) and (not skip_expensive_tail):
                 _run_phase(
                     "relaxed_release",
                     strict_release_filter=False,
@@ -1911,7 +2583,7 @@ class RutrackerService:
                     phase_only_lossless=only_lossless,
                     deadline=non_fallback_deadline,
                 )
-            if not items:
+            if (not items) and (not skip_expensive_tail):
                 _run_phase(
                     "relaxed_filematch",
                     strict_release_filter=False,
@@ -1919,7 +2591,7 @@ class RutrackerService:
                     phase_only_lossless=only_lossless,
                     deadline=non_fallback_deadline,
                 )
-            if not items and only_lossless is True:
+            if (not items) and (not skip_expensive_tail) and only_lossless is True:
                 _run_phase(
                     "relaxed_lossless",
                     strict_release_filter=False,
@@ -1929,6 +2601,7 @@ class RutrackerService:
                 )
             if (
                 not items
+                and (not skip_expensive_tail)
                 and time.time() < non_fallback_deadline
                 and time.time() < (t0 + budget + self.track_force_relaxed_filematch_grace_sec)
             ):
@@ -1950,7 +2623,7 @@ class RutrackerService:
                     True,
                 )
                 _merge_more(forced_more)
-            if not items:
+            if (not items) and (not skip_expensive_tail):
                 log.debug("track phase=artist_fallback_trackchecked query=%r", artist_base)
                 fallback_budget = max(0.8, min(1.8, fallback_reserve_sec + 0.6))
                 fallback_t0 = time.time()
@@ -1981,8 +2654,8 @@ class RutrackerService:
                 log.debug("Search produced 0 items -> skip caching to avoid sticky empty cache")
 
             log.debug(
-                "Search metrics: success=True, duration=%.3fs, query=%r, lossless=%s, track=%r (conf=%.2f)",
-                time.time() - t0, artist, only_lossless, track, conf
+                "Search metrics: success=True, duration=%.3fs, query=%r, lossless=%s, track_raw=%r, track_effective=%r (conf=%.2f)",
+                time.time() - t0, artist, only_lossless, track_raw, track, conf
             )
             return items
         except Exception as e:
@@ -2190,23 +2863,31 @@ class RutrackerService:
                 t0 = time.time()
                 budget = self.track_time_budget_sec
                 want = max(1, self.want_results)
-                artist_base = _derive_artist_from_query(query, track)
+                track_raw = (track or "").strip()
+                track_core = _normalize_track_query(track_raw) if track_raw else ""
+                track_effective = track_core or track_raw
+                track = track_effective
+                artist_base = _derive_artist_from_query(query, track_effective)
 
                 albums: List[str] = []
                 conf = 0.0
                 resolver_error: Optional[str] = None
                 try:
-                    meta = resolve_track(artist_base, track)
+                    meta = resolve_track(artist_base, track_effective)
                     albums = [a for a in ([meta.primary_album] if getattr(meta, "primary_album", None) else []) +
                               ((getattr(meta, "albums", []) or [])) if a]
                     albums = _sanitize_album_hints(albums)
+                    albums = _refine_album_hints_for_track(albums, track_effective)
                     conf = float(getattr(meta, "confidence", 0.0) or 0.0)
                 except Exception as e:
                     resolver_error = str(e)
 
                 resolver_payload = {
                     "effective_artist": artist_base,
-                    "track": track,
+                    "track": track_effective,
+                    "track_raw": track_raw,
+                    "track_core": track_core,
+                    "track_effective": track_effective,
                     "albums": albums,
                     "confidence": conf,
                     "error": resolver_error,
@@ -2221,6 +2902,10 @@ class RutrackerService:
                 non_fallback_deadline = t0 + non_fallback_budget
                 strict_deadline = min(t0 + strict_budget, non_fallback_deadline)
                 resolver_payload["fallback_reserve_sec"] = fallback_reserve_sec
+                strict_track_rows_total = 0
+                strict_artist_prefilter = 0
+                skip_expensive_tail = False
+                single_token_artist = len(_artist_tokens(artist_base)) == 1
 
                 def _run_pass(
                     phase_name: str,
@@ -2230,6 +2915,7 @@ class RutrackerService:
                     relax_file_match: bool,
                     phase_only_lossless: Optional[bool],
                     track_for_pass: Optional[str] = track,
+                    album_hints_override: Optional[List[str]] = None,
                     max_pages_override: Optional[int] = None,
                     max_candidates_override: Optional[int] = None,
                     deadline: Optional[float] = None,
@@ -2237,15 +2923,16 @@ class RutrackerService:
                     allow_over_budget: bool = False,
                     soft_artist_match: bool = False,
                     fuzzy_track_match: bool = False,
+                    recheck_cached_miss_top_n: int = 0,
                     call_t0_override: Optional[float] = None,
-                ) -> None:
+                ) -> Optional[Dict[str, Any]]:
                     if len(pipeline_items) >= want:
-                        return
+                        return None
                     now = time.time()
                     if deadline is not None and now >= deadline:
-                        return
+                        return None
                     if not allow_over_budget and (now - t0) >= budget:
-                        return
+                        return None
                     dbg: Dict[str, Any] = {}
                     before = len(pipeline_items)
                     started_pass = time.time()
@@ -2257,7 +2944,7 @@ class RutrackerService:
                         artist_base,
                         phase_only_lossless,
                         track_for_pass,
-                        albums,
+                        albums if album_hints_override is None else album_hints_override,
                         call_t0,
                         call_budget,
                         want if track_for_pass else max(want, 5),
@@ -2267,6 +2954,7 @@ class RutrackerService:
                         relax_file_match,
                         soft_artist_match,
                         fuzzy_track_match,
+                        recheck_cached_miss_top_n,
                         debug_info=dbg,
                     )
                     added = _merge_unique(pipeline_items, more, max(want, 5) if track_for_pass is None else want)
@@ -2279,6 +2967,7 @@ class RutrackerService:
                             "relax_file_match": relax_file_match,
                             "soft_artist_match": soft_artist_match,
                             "fuzzy_track_match": fuzzy_track_match,
+                            "recheck_cached_miss_top_n": int(recheck_cached_miss_top_n or 0),
                             "only_lossless": phase_only_lossless,
                             "track_filter_enabled": bool(track_for_pass),
                             "duration_ms": int((time.time() - started_pass) * 1000),
@@ -2289,6 +2978,7 @@ class RutrackerService:
                             "debug": dbg,
                         }
                     )
+                    return dbg
 
                 def _run_phase(
                     phase_name: str,
@@ -2299,10 +2989,31 @@ class RutrackerService:
                     album_limit_if_nohit: Optional[int] = None,
                     soft_artist_match: bool = False,
                     fuzzy_track_match: bool = False,
+                    album_recheck_cached_miss_top_n: int = 0,
                 ) -> None:
+                    nonlocal strict_track_rows_total, strict_artist_prefilter
                     phase_budget = budget if deadline is None else max(0.1, deadline - t0)
+                    track_max_pages_override = 1 if strict_release_filter else None
                     album_attempts = 0
-                    _run_pass(
+                    artist_only_ran = False
+                    if single_token_artist and (not do_album_passes):
+                        artist_track_q_dbg = _run_pass(
+                            phase_name,
+                            "artist_track_quoted",
+                            f'"{artist_base}" "{track}"',
+                            strict_release_filter,
+                            relax_file_match,
+                            phase_only_lossless,
+                            deadline=deadline,
+                            max_pages_override=1,
+                            max_candidates_override=min(12, self.track_max_candidates_per_pass),
+                            budget_override=phase_budget,
+                            soft_artist_match=soft_artist_match,
+                            fuzzy_track_match=fuzzy_track_match,
+                        )
+                        if phase_name == "strict":
+                            strict_track_rows_total += int((artist_track_q_dbg or {}).get("rows_total") or 0)
+                    track_q_dbg = _run_pass(
                         phase_name,
                         "track_quoted",
                         f'{artist_base} "{track}"',
@@ -2310,11 +3021,14 @@ class RutrackerService:
                         relax_file_match,
                         phase_only_lossless,
                         deadline=deadline,
+                        max_pages_override=track_max_pages_override,
                         budget_override=phase_budget,
                         soft_artist_match=soft_artist_match,
                         fuzzy_track_match=fuzzy_track_match,
                     )
-                    _run_pass(
+                    if phase_name == "strict":
+                        strict_track_rows_total += int((track_q_dbg or {}).get("rows_total") or 0)
+                    track_plain_dbg = _run_pass(
                         phase_name,
                         "track_plain",
                         f"{artist_base} {track}",
@@ -2322,22 +3036,52 @@ class RutrackerService:
                         relax_file_match,
                         phase_only_lossless,
                         deadline=deadline,
+                        max_pages_override=track_max_pages_override,
                         budget_override=phase_budget,
                         soft_artist_match=soft_artist_match,
                         fuzzy_track_match=fuzzy_track_match,
                     )
-                    _run_pass(
-                        phase_name,
-                        "artist_only_query",
-                        artist_base,
-                        strict_release_filter,
-                        relax_file_match,
-                        phase_only_lossless,
-                        deadline=deadline,
-                        budget_override=phase_budget,
-                        soft_artist_match=soft_artist_match,
-                        fuzzy_track_match=fuzzy_track_match,
-                    )
+                    if phase_name == "strict":
+                        strict_track_rows_total += int((track_plain_dbg or {}).get("rows_total") or 0)
+
+                    if phase_only_lossless is False:
+                        deep_lossy_artist_scan = bool(
+                            track
+                            and strict_release_filter
+                            and (not relax_file_match)
+                            and len(pipeline_items) == 0
+                        )
+                        artist_pages_override = track_max_pages_override
+                        artist_candidates_override = self.track_max_candidates_per_pass
+                        artist_recheck_cached_miss_top_n = 0
+                        if deep_lossy_artist_scan:
+                            artist_pages_override = max(2, min(3, self.track_max_pages_wide))
+                            artist_candidates_override = min(80, max(60, self.track_max_candidates_per_pass * 2))
+                            artist_recheck_cached_miss_top_n = min(
+                                artist_candidates_override,
+                                max(12, self.track_max_candidates_per_pass),
+                            )
+                        artist_dbg = _run_pass(
+                            phase_name,
+                            "artist_only_query",
+                            artist_base,
+                            strict_release_filter,
+                            relax_file_match,
+                            phase_only_lossless,
+                            deadline=deadline,
+                            max_pages_override=artist_pages_override,
+                            max_candidates_override=artist_candidates_override,
+                            budget_override=phase_budget,
+                            soft_artist_match=soft_artist_match,
+                            fuzzy_track_match=fuzzy_track_match,
+                            recheck_cached_miss_top_n=artist_recheck_cached_miss_top_n,
+                        )
+                        if phase_name == "strict":
+                            strict_artist_prefilter = max(
+                                strict_artist_prefilter,
+                                int((artist_dbg or {}).get("rows_after_prefilter") or 0),
+                            )
+                        artist_only_ran = True
 
                     if do_album_passes:
                         for alb in albums:
@@ -2359,8 +3103,10 @@ class RutrackerService:
                                 budget_override=phase_budget,
                                 soft_artist_match=soft_artist_match,
                                 fuzzy_track_match=fuzzy_track_match,
+                                recheck_cached_miss_top_n=album_recheck_cached_miss_top_n,
                             )
                             album_attempts += 1
+
                         for alb in albums:
                             if (
                                 album_limit_if_nohit is not None
@@ -2380,8 +3126,35 @@ class RutrackerService:
                                 budget_override=phase_budget,
                                 soft_artist_match=soft_artist_match,
                                 fuzzy_track_match=fuzzy_track_match,
+                                recheck_cached_miss_top_n=album_recheck_cached_miss_top_n,
                             )
                             album_attempts += 1
+
+                    if not artist_only_ran:
+                        artist_dbg = _run_pass(
+                            phase_name,
+                            "artist_only_query",
+                            artist_base,
+                            strict_release_filter,
+                            relax_file_match,
+                            phase_only_lossless,
+                            deadline=deadline,
+                            budget_override=phase_budget,
+                            soft_artist_match=soft_artist_match,
+                            fuzzy_track_match=fuzzy_track_match,
+                        )
+                        if phase_name == "strict":
+                            strict_artist_prefilter = max(
+                                strict_artist_prefilter,
+                                int((artist_dbg or {}).get("rows_after_prefilter") or 0),
+                            )
+
+                strict_album_limit_nohit = self.track_strict_album_limit_nohit if do_album_passes else None
+                if strict_album_limit_nohit is not None and strict_album_limit_nohit < 2 and only_lossless is True:
+                    strict_album_limit_nohit = 2
+                cached_miss_recheck_top_n = min(14, max(10, self.track_max_candidates_per_pass))
+                resolver_payload["strict_album_limit_nohit_effective"] = strict_album_limit_nohit
+                resolver_payload["cached_miss_recheck_top_n"] = cached_miss_recheck_top_n
 
                 _run_phase(
                     "strict",
@@ -2389,7 +3162,28 @@ class RutrackerService:
                     False,
                     only_lossless,
                     deadline=strict_deadline,
-                    album_limit_if_nohit=self.track_strict_album_limit_nohit if do_album_passes else None,
+                    album_limit_if_nohit=strict_album_limit_nohit,
+                    album_recheck_cached_miss_top_n=cached_miss_recheck_top_n,
+                )
+                skip_expensive_tail = (
+                    strict_track_rows_total == 0
+                    and strict_artist_prefilter == 0
+                    and (not do_album_passes)
+                )
+                resolver_payload["strict_track_rows_total"] = strict_track_rows_total
+                resolver_payload["strict_artist_prefilter"] = strict_artist_prefilter
+                resolver_payload["skip_expensive_tail"] = bool(skip_expensive_tail)
+                resolver_payload["strict_deep_track_enabled"] = bool(
+                    track and strict_track_rows_total >= 8 and _is_short_common_track(track) and only_lossless is not False
+                )
+                resolver_payload["artist_album_rescue_enabled"] = bool(
+                    track
+                    and strict_track_rows_total >= 6
+                    and _is_short_common_track(track)
+                    and len(_artist_tokens(artist_base)) <= 2
+                )
+                resolver_payload["lossy_album_deep_enabled"] = bool(
+                    track and only_lossless is False and do_album_passes
                 )
                 if not pipeline_items and typo_recovery_enabled and time.time() < non_fallback_deadline:
                     typo_budget = min(1.6, max(0.7, budget * 0.28))
@@ -2413,14 +3207,199 @@ class RutrackerService:
                             fuzzy_track_match=True,
                             call_t0_override=time.time(),
                         )
-                if not pipeline_items:
+                if (
+                    not pipeline_items
+                    and track_raw
+                    and _norm(track_raw) != _norm(track)
+                    and time.time() < non_fallback_deadline
+                ):
+                    raw_deadline = min(non_fallback_deadline, time.time() + 1.2)
+                    raw_phase_budget = max(0.4, min(1.0, raw_deadline - time.time()))
+                    for rq in (f'{artist_base} "{track_raw}"', f"{artist_base} {track_raw}"):
+                        if time.time() >= raw_deadline or len(pipeline_items) >= want:
+                            break
+                        _run_pass(
+                            "raw_track_fallback",
+                            "raw_track_query",
+                            rq,
+                            False,
+                            False,
+                            only_lossless,
+                            track_for_pass=track,
+                            deadline=raw_deadline,
+                            max_pages_override=1,
+                            max_candidates_override=min(12, self.track_max_candidates_per_pass),
+                            budget_override=raw_phase_budget,
+                            soft_artist_match=True,
+                            fuzzy_track_match=True,
+                            call_t0_override=time.time(),
+                        )
+                if (
+                    not pipeline_items
+                    and track
+                    and strict_track_rows_total >= 8
+                    and _is_short_common_track(track)
+                    and only_lossless is not False
+                    and time.time() < non_fallback_deadline
+                ):
+                    deep_deadline = min(non_fallback_deadline, time.time() + 1.4)
+                    deep_phase_budget = max(0.5, min(1.2, deep_deadline - time.time()))
+                    deep_candidates = min(60, max(36, self.track_max_candidates_per_pass * 2))
+                    deep_recheck = min(deep_candidates, max(12, self.track_max_candidates_per_pass))
+                    for dq_kind, dq in (
+                        ("deep_track_quoted", f'{artist_base} "{track}"'),
+                        ("deep_track_plain", f"{artist_base} {track}"),
+                    ):
+                        if time.time() >= deep_deadline or len(pipeline_items) >= want:
+                            break
+                        _run_pass(
+                            "strict_deep_track",
+                            dq_kind,
+                            dq,
+                            True,
+                            False,
+                            only_lossless,
+                            deadline=deep_deadline,
+                            max_pages_override=1,
+                            max_candidates_override=deep_candidates,
+                            budget_override=deep_phase_budget,
+                            recheck_cached_miss_top_n=deep_recheck,
+                            call_t0_override=time.time(),
+                        )
+                rescue_time_limit = non_fallback_deadline if only_lossless is not False else (t0 + budget + 0.6)
+                if (
+                    not pipeline_items
+                    and track
+                    and strict_track_rows_total >= 6
+                    and _is_short_common_track(track)
+                    and len(_artist_tokens(artist_base)) <= 2
+                    and time.time() < rescue_time_limit
+                ):
+                    rescue_deadline = min(rescue_time_limit, time.time() + 1.8)
+                    rescue_budget = max(0.7, min(1.6, rescue_deadline - time.time()))
+                    rescue_t0 = time.time()
+                    rescue_dbg: Dict[str, Any] = {}
+                    rescue_hints = self._discover_album_hints_from_artist_rows(
+                        artist_query=artist_base,
+                        track=track,
+                        t0=rescue_t0,
+                        budget=rescue_budget,
+                        max_pages=1,
+                        max_rows=120,
+                        debug_info=rescue_dbg,
+                    )
+                    resolver_payload["artist_album_rescue_hints"] = rescue_hints[:6]
+                    resolver_payload["artist_album_rescue_debug"] = rescue_dbg
+                    if rescue_hints:
+                        rescue_candidates = min(30, max(18, self.track_max_candidates_per_pass))
+                        rescue_recheck = min(rescue_candidates, max(10, self.track_max_candidates_per_pass))
+                        for alb in rescue_hints[:3]:
+                            if time.time() >= rescue_deadline or len(pipeline_items) >= want:
+                                break
+                            album_ctx = [alb] + [a for a in albums if _norm(a) != _norm(alb)]
+                            for pass_kind, rq in (
+                                ("rescue_album_quoted", f'{artist_base} "{alb}"'),
+                                ("rescue_album_plain", f"{artist_base} {alb}"),
+                            ):
+                                if time.time() >= rescue_deadline or len(pipeline_items) >= want:
+                                    break
+                                _run_pass(
+                                    "strict_artist_album_rescue",
+                                    pass_kind,
+                                    rq,
+                                    True,
+                                    False,
+                                    only_lossless,
+                                    track_for_pass=track,
+                                    album_hints_override=album_ctx,
+                                    deadline=rescue_deadline,
+                                    max_pages_override=1,
+                                    max_candidates_override=rescue_candidates,
+                                    budget_override=rescue_budget,
+                                    recheck_cached_miss_top_n=rescue_recheck,
+                                    call_t0_override=time.time(),
+                                )
+                if (
+                    not pipeline_items
+                    and track
+                    and only_lossless is False
+                    and do_album_passes
+                    and time.time() < (t0 + budget + 0.9)
+                ):
+                    lossy_deadline = min(t0 + budget + 0.9, time.time() + 1.6)
+                    lossy_budget = max(0.6, min(1.4, lossy_deadline - time.time()))
+                    lossy_t0 = time.time()
+                    lossy_dbg: Dict[str, Any] = {}
+                    lossy_hints = self._discover_album_hints_from_artist_rows(
+                        artist_query=artist_base,
+                        track=track,
+                        t0=lossy_t0,
+                        budget=lossy_budget,
+                        max_pages=2,
+                        max_rows=180,
+                        debug_info=lossy_dbg,
+                    )
+                    resolver_payload["lossy_album_deep_hints"] = (lossy_hints or [])[:8]
+                    resolver_payload["lossy_album_deep_debug"] = lossy_dbg
+                    already_tried_albums: set[str] = set()
+                    if strict_album_limit_nohit is not None and strict_album_limit_nohit > 0:
+                        for a in albums[:strict_album_limit_nohit]:
+                            an = _norm(a)
+                            if an:
+                                already_tried_albums.add(an)
+                    album_pool: List[str] = []
+                    seen_pool: set[str] = set()
+                    for source in (lossy_hints, albums):
+                        for alb in source:
+                            an = _norm(alb)
+                            if not an or an in seen_pool or an in already_tried_albums:
+                                continue
+                            seen_pool.add(an)
+                            album_pool.append(alb)
+                            if len(album_pool) >= 6:
+                                break
+                        if len(album_pool) >= 6:
+                            break
+                    resolver_payload["lossy_album_deep_pool"] = album_pool[:6]
+                    if album_pool:
+                        deep_candidates = min(48, max(30, self.track_max_candidates_per_pass * 2))
+                        deep_recheck = min(deep_candidates, max(12, self.track_max_candidates_per_pass))
+                        for alb in album_pool[:4]:
+                            if time.time() >= lossy_deadline or len(pipeline_items) >= want:
+                                break
+                            album_ctx = [alb] + [a for a in albums if _norm(a) != _norm(alb)]
+                            for pass_kind, rq in (
+                                ("lossy_deep_album_quoted", f'{artist_base} "{alb}"'),
+                                ("lossy_deep_album_plain", f"{artist_base} {alb}"),
+                            ):
+                                if time.time() >= lossy_deadline or len(pipeline_items) >= want:
+                                    break
+                                _run_pass(
+                                    "lossy_album_deep",
+                                    pass_kind,
+                                    rq,
+                                    True,
+                                    False,
+                                    only_lossless,
+                                    track_for_pass=track,
+                                    album_hints_override=album_ctx,
+                                    deadline=lossy_deadline,
+                                    max_pages_override=1,
+                                    max_candidates_override=deep_candidates,
+                                    budget_override=lossy_budget,
+                                    allow_over_budget=True,
+                                    recheck_cached_miss_top_n=deep_recheck,
+                                    call_t0_override=time.time(),
+                                )
+                if not pipeline_items and (not skip_expensive_tail):
                     _run_phase("relaxed_release", False, False, only_lossless, deadline=non_fallback_deadline)
-                if not pipeline_items:
+                if not pipeline_items and (not skip_expensive_tail):
                     _run_phase("relaxed_filematch", False, True, only_lossless, deadline=non_fallback_deadline)
-                if not pipeline_items and only_lossless is True:
+                if not pipeline_items and (not skip_expensive_tail) and only_lossless is True:
                     _run_phase("relaxed_lossless", False, True, None, deadline=non_fallback_deadline)
                 if (
                     not pipeline_items
+                    and (not skip_expensive_tail)
                     and time.time() < non_fallback_deadline
                     and time.time() < (t0 + budget + self.track_force_relaxed_filematch_grace_sec)
                 ):
@@ -2436,7 +3415,7 @@ class RutrackerService:
                         budget_override=budget + self.track_force_relaxed_filematch_grace_sec,
                         allow_over_budget=True,
                     )
-                if not pipeline_items:
+                if not pipeline_items and (not skip_expensive_tail):
                     fallback_budget = max(0.8, min(1.8, fallback_reserve_sec + 0.6))
                     _run_pass(
                         "artist_fallback",
@@ -2451,6 +3430,7 @@ class RutrackerService:
                         allow_over_budget=True,
                         soft_artist_match=True,
                         fuzzy_track_match=True,
+                        recheck_cached_miss_top_n=cached_miss_recheck_top_n,
                         call_t0_override=time.time(),
                     )
 
@@ -2651,7 +3631,6 @@ class RutrackerService:
             if last_net_err:
                 raise last_net_err
             raise RuntimeError("RuTracker download failed before response")
-        r.encoding = "cp1251"
         r.raise_for_status()
         if "application/x-bittorrent" in (r.headers.get("Content-Type") or ""):
             return r.content
