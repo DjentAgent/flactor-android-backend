@@ -32,7 +32,8 @@ class Settings(BaseSettings):
     redis_enabled: bool = Field(default=True, alias="REDIS_ENABLED")
     redis_startup_retries: int = Field(default=8, alias="REDIS_STARTUP_RETRIES")
     redis_startup_retry_delay_sec: float = Field(default=1.0, alias="REDIS_STARTUP_RETRY_DELAY_SEC")
-    search_pb_soft_timeout_sec: float = Field(default=4.0, alias="SEARCH_PB_SOFT_TIMEOUT_SEC")
+    search_pb_soft_timeout_sec: float = Field(default=2.5, alias="SEARCH_PB_SOFT_TIMEOUT_SEC")
+    search_pb_track_min_rt_results_to_skip: int = Field(default=1, alias="SEARCH_PB_TRACK_MIN_RT_RESULTS_TO_SKIP")
 
     # RuTracker
     rutracker_login: Optional[str] = Field(default=None, alias="RUTRACKER_LOGIN")

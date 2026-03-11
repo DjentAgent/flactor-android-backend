@@ -3280,6 +3280,7 @@ class RutrackerService:
                 strict_artist_prefilter = 0
                 skip_expensive_tail = False
                 single_token_artist = len(_artist_tokens(artist_base)) == 1
+                raw_track_for_pass = track_raw or track_effective
 
                 def _run_pass(
                     phase_name: str,

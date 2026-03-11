@@ -55,13 +55,11 @@ async def test_search_all_uses_pb_when_rutracker_empty():
 
 
 @pytest.mark.asyncio
-async def test_search_all_rt_first_skips_pb_when_enough_rt_results():
+async def test_search_all_track_skips_pb_when_rt_enough():
     rt = _FakeTracker(
         "rutracker",
         [
             TrackerSearchResult("R1", "u1", "1 MB", 100, 1, "rutracker"),
-            TrackerSearchResult("R2", "u2", "1 MB", 90, 1, "rutracker"),
-            TrackerSearchResult("R3", "u3", "1 MB", 80, 1, "rutracker"),
         ],
     )
     pb = _SlowFakeTracker(
@@ -73,10 +71,11 @@ async def test_search_all_rt_first_skips_pb_when_enough_rt_results():
         rutracker=rt,
         piratebay=pb,
         pb_soft_timeout_sec=2.5,
+        pb_track_min_rt_results_to_skip=1,
     )
-    results = await usecase.search_all("q")
+    results = await usecase.search_all("q", track="t")
 
-    assert [r.title for r in results] == ["R1", "R2", "R3"]
+    assert [r.title for r in results] == ["R1"]
     assert pb.cancelled is True or pb.started is False
 
 
@@ -100,3 +99,26 @@ async def test_search_all_pb_soft_timeout_when_rt_insufficient():
     assert results == []
     assert pb.cancelled is True
     assert elapsed < 0.3
+
+
+@pytest.mark.asyncio
+async def test_search_all_artist_only_merges_pb_even_with_rt_results():
+    rt = _FakeTracker(
+        "rutracker",
+        [TrackerSearchResult("R1", "u1", "1 MB", 100, 1, "rutracker")],
+    )
+    pb = _SlowFakeTracker(
+        [TrackerSearchResult("PB1", "up1", "1 MB", 150, 1, "piratebay")],
+        delay_sec=0.01,
+    )
+
+    usecase = TorrentSearchUseCase(
+        rutracker=rt,
+        piratebay=pb,
+        pb_soft_timeout_sec=2.5,
+        pb_track_min_rt_results_to_skip=1,
+    )
+    results = await usecase.search_all("artist query")
+
+    assert [r.title for r in results] == ["PB1", "R1"]
+    assert pb.started is True

@@ -15,13 +15,22 @@ class TorrentSearchUseCase:
         rutracker: TrackerSearchClient,
         piratebay: TrackerSearchClient,
         pb_soft_timeout_sec: float | None = None,
+        pb_track_min_rt_results_to_skip: int | None = None,
     ):
         self.rutracker = rutracker
         self.piratebay = piratebay
         self.pb_soft_timeout_sec = float(
             pb_soft_timeout_sec
             if pb_soft_timeout_sec is not None
-            else getattr(settings, "search_pb_soft_timeout_sec", 4.0)
+            else getattr(settings, "search_pb_soft_timeout_sec", 2.5)
+        )
+        self.pb_track_min_rt_results_to_skip = max(
+            0,
+            int(
+                pb_track_min_rt_results_to_skip
+                if pb_track_min_rt_results_to_skip is not None
+                else getattr(settings, "search_pb_track_min_rt_results_to_skip", 1)
+            ),
         )
 
     async def search_all(
@@ -30,6 +39,7 @@ class TorrentSearchUseCase:
         only_lossless: bool | None = None,
         track: str | None = None,
     ) -> list[TrackerSearchResult]:
+        is_track_query = bool((track or "").strip())
         pb_task = asyncio.create_task(
             self.piratebay.search(query, only_lossless=only_lossless, track=track)
         )
@@ -42,8 +52,12 @@ class TorrentSearchUseCase:
         except Exception:
             rt_results = []
 
-        # PirateBay is now strict fallback: only when RuTracker has no results.
-        if len(rt_results) > 0:
+        # Policy:
+        # - artist-only queries: PB is always best-effort (adds breadth).
+        # - track queries: PB only when RT result count is low.
+        if not is_track_query:
+            pb_results = await self._wait_pb_best_effort(pb_task)
+        elif len(rt_results) >= self.pb_track_min_rt_results_to_skip:
             await self._cancel_task(pb_task)
             pb_results = []
         else:
