@@ -172,6 +172,152 @@ def _compact_no_space(s: str) -> str:
     return re.sub(r"\s+", "", _norm(s))
 
 
+_CYR_TO_LAT_MAP: Dict[str, str] = {
+    "а": "a",
+    "б": "b",
+    "в": "v",
+    "г": "g",
+    "д": "d",
+    "е": "e",
+    "ё": "yo",
+    "ж": "zh",
+    "з": "z",
+    "и": "i",
+    "й": "y",
+    "к": "k",
+    "л": "l",
+    "м": "m",
+    "н": "n",
+    "о": "o",
+    "п": "p",
+    "р": "r",
+    "с": "s",
+    "т": "t",
+    "у": "u",
+    "ф": "f",
+    "х": "kh",
+    "ц": "ts",
+    "ч": "ch",
+    "ш": "sh",
+    "щ": "shch",
+    "ы": "y",
+    "э": "e",
+    "ю": "yu",
+    "я": "ya",
+    "ь": "",
+    "ъ": "",
+}
+
+_LAT_TO_CYR_MULTI: Tuple[Tuple[str, str], ...] = (
+    ("shch", "щ"),
+    ("sch", "щ"),
+    ("yo", "ё"),
+    ("jo", "ё"),
+    ("yu", "ю"),
+    ("ju", "ю"),
+    ("ya", "я"),
+    ("ja", "я"),
+    ("zh", "ж"),
+    ("kh", "х"),
+    ("ts", "ц"),
+    ("ch", "ч"),
+    ("sh", "ш"),
+    ("ye", "е"),
+    ("yi", "и"),
+)
+
+_LAT_TO_CYR_SINGLE: Dict[str, str] = {
+    "a": "а",
+    "b": "б",
+    "c": "к",
+    "d": "д",
+    "e": "е",
+    "f": "ф",
+    "g": "г",
+    "h": "х",
+    "i": "и",
+    "j": "й",
+    "k": "к",
+    "l": "л",
+    "m": "м",
+    "n": "н",
+    "o": "о",
+    "p": "п",
+    "q": "к",
+    "r": "р",
+    "s": "с",
+    "t": "т",
+    "u": "у",
+    "v": "в",
+    "w": "в",
+    "x": "кс",
+    "y": "ы",
+    "z": "з",
+}
+
+
+def _has_cyrillic(text: str) -> bool:
+    return bool(re.search(r"[а-яё]", _norm(text)))
+
+
+def _has_latin(text: str) -> bool:
+    return bool(re.search(r"[a-z]", _norm(text)))
+
+
+def _translit_cyr_to_lat(text: str) -> str:
+    n = _norm(text)
+    if not n:
+        return ""
+    out: List[str] = []
+    for ch in n:
+        out.append(_CYR_TO_LAT_MAP.get(ch, ch))
+    return re.sub(r"\s+", " ", "".join(out)).strip()
+
+
+def _translit_lat_to_cyr(text: str) -> str:
+    n = _norm(text)
+    if not n:
+        return ""
+    out: List[str] = []
+    i = 0
+    while i < len(n):
+        matched = False
+        for src, dst in _LAT_TO_CYR_MULTI:
+            if n.startswith(src, i):
+                out.append(dst)
+                i += len(src)
+                matched = True
+                break
+        if matched:
+            continue
+        ch = n[i]
+        out.append(_LAT_TO_CYR_SINGLE.get(ch, ch))
+        i += 1
+    return re.sub(r"\s+", " ", "".join(out)).strip()
+
+
+def _script_variants(text: str) -> List[str]:
+    base = _norm(text)
+    if not base:
+        return []
+    out: List[str] = []
+    seen: set[str] = set()
+
+    def add(v: str) -> None:
+        vv = _norm(v)
+        if not vv or vv in seen:
+            return
+        seen.add(vv)
+        out.append(vv)
+
+    add(base)
+    if _has_cyrillic(base):
+        add(_translit_cyr_to_lat(base))
+    if _has_latin(base):
+        add(_translit_lat_to_cyr(base))
+    return out
+
+
 def _track_aliases(track: str) -> List[str]:
     tr = _norm(track)
     if not tr:
@@ -186,7 +332,14 @@ def _track_aliases(track: str) -> List[str]:
     }
     if " - " in tr:
         variants.add(tr.split(" - ", 1)[0].strip())
-    aliases = [v for v in variants if v]
+    variants_expanded: set[str] = set()
+    for v in variants:
+        if not v:
+            continue
+        variants_expanded.add(v)
+        for sv in _script_variants(v):
+            variants_expanded.add(sv)
+    aliases = [v for v in variants_expanded if v]
     aliases.sort(key=len, reverse=True)
     return aliases
 
@@ -231,6 +384,29 @@ def _normalize_track_query(track: str) -> str:
     if not _has_meaningful_track_token(core):
         return n
     return core
+
+
+def _keep_raw_track_form(track_raw: str, track_core: str) -> bool:
+    raw = (track_raw or "").strip()
+    core = (track_core or "").strip()
+    if not raw or not core:
+        return False
+    if _norm(raw) == _norm(core):
+        return False
+    # Keep forms like "E-95" that are semantically meaningful but can be
+    # over-normalized into short ambiguous tails.
+    if re.search(r"[A-Za-zА-Яа-яЁё]\s*-\s*\d{1,3}\b", raw):
+        return True
+    raw_n = _norm(raw)
+    core_n = _norm(core)
+    if raw_n.startswith(core_n + " "):
+        tail = raw_n[len(core_n) :].strip().split()
+        if tail and all(re.fullmatch(r"\d{1,3}", t) for t in tail):
+            toks = core_n.split()
+            prev = toks[-1] if toks else ""
+            if len(prev) <= 2:
+                return True
+    return False
 
 
 def _is_short_common_track(track: Optional[str]) -> bool:
@@ -479,12 +655,13 @@ def _build_typo_recovery_queries(artist: str, track: str) -> List[str]:
             out_keys.append(vv)
 
         for tok in sorted(tokens, key=len, reverse=True):
-            collapsed = _collapse_repeats(tok)
-            if collapsed != tok:
-                add_key(collapsed)
-            add_key(tok)
-            if len(tok) >= 6:
-                add_key(tok[: max(4, min(6, len(tok) - 1))])
+            for tvar in _script_variants(tok):
+                collapsed = _collapse_repeats(tvar)
+                if collapsed != tvar:
+                    add_key(collapsed)
+                add_key(tvar)
+                if len(tvar) >= 6:
+                    add_key(tvar[: max(4, min(6, len(tvar) - 1))])
         return out_keys[:4]
 
     def _track_recovery_chunks(text: str) -> List[str]:
@@ -543,23 +720,112 @@ def _build_typo_recovery_queries(artist: str, track: str) -> List[str]:
         seen.add(k)
         out.append(qq)
 
+    track_forms: List[str] = []
+    track_seen: set[str] = set()
+
+    def add_track_form(v: str) -> None:
+        vv = _norm(v)
+        if not vv or vv in track_seen:
+            return
+        track_seen.add(vv)
+        track_forms.append(vv)
+
+    add_track_form(tr)
+    for sv in _script_variants(tr):
+        add_track_form(sv)
+
+    if artist_keys:
+        first_artist_vars = _script_variants(artist_keys[0])[:2]
+        for av in (first_artist_vars or [artist_keys[0]]):
+            for tf in track_forms[:2]:
+                add(f'{av} "{tf}"')
+                add(f"{av} {tf}")
+            for ch in track_chunks[:2]:
+                add(f"{av} {ch}")
+    if len(artist_keys) > 1:
+        second_artist_vars = _script_variants(artist_keys[1])[:2]
+        for av in (second_artist_vars or [artist_keys[1]]):
+            add(f'{av} "{track_forms[0]}"')
+
+    for tf in track_forms:
+        add(f'"{tf}"')
+        add(tf)
+
     for ch in track_chunks:
         add(ch)
-
-    add(f'"{tr}"')
-    add(tr)
+        for cvar in _script_variants(ch):
+            add(cvar)
 
     for ak in artist_keys:
         add(ak)
-    if artist_keys:
-        for ch in track_chunks[:2]:
-            add(f"{artist_keys[0]} {ch}")
-        add(f'{artist_keys[0]} "{tr}"')
-        add(f"{artist_keys[0]} {tr}")
-    if len(artist_keys) > 1:
-        add(f'{artist_keys[1]} "{tr}"')
 
-    return out[:10]
+    return out[:14]
+
+
+def _build_script_variant_strict_queries(artist: str, track: str) -> List[str]:
+    art = _norm(artist or "")
+    tr_raw = (track or "").strip()
+    tr = _normalize_track_query(tr_raw) or _norm(tr_raw)
+    if not art or not tr:
+        return []
+
+    needs_bridge = ((_has_latin(art) and not _has_cyrillic(art)) or (_has_latin(tr) and not _has_cyrillic(tr)))
+    if not needs_bridge:
+        return []
+
+    artist_vars = _script_variants(art)
+    track_vars = _script_variants(tr)
+    if not artist_vars or not track_vars:
+        return []
+
+    def _sort_variants(values: List[str], base: str) -> List[str]:
+        return sorted(
+            values,
+            key=lambda v: (
+                0 if _has_cyrillic(v) else 1,
+                0 if _norm(v) != _norm(base) else 1,
+                len(v),
+            ),
+        )
+
+    artist_vars = _sort_variants(artist_vars, art)
+    track_vars = _sort_variants(track_vars, tr)
+
+    out: List[str] = []
+    seen: set[str] = set()
+
+    def add(q: str) -> None:
+        qq = (q or "").strip()
+        if not qq:
+            return
+        k = _norm(qq)
+        if not k or k in seen:
+            return
+        seen.add(k)
+        out.append(qq)
+
+    artist_alt = [v for v in artist_vars if _norm(v) != _norm(art)]
+    track_alt = [v for v in track_vars if _norm(v) != _norm(tr)]
+
+    for av in artist_alt[:2]:
+        add(av)
+
+    # Prioritize cyrillic translit bridge and artist-only probe, since
+    # for single-token artists this often gives better prefilter recall.
+    for av in artist_alt[:2]:
+        for tv in track_alt[:1]:
+            add(f'{av} "{tv}"')
+            add(f"{av} {tv}")
+
+    for av in artist_alt[:2]:
+        add(f'{av} "{tr}"')
+        add(f"{av} {tr}")
+
+    for tv in track_alt[:1]:
+        add(f'{art} "{tv}"')
+        add(f"{art} {tv}")
+
+    return out[:6]
 
 
 def _normalized_text(resp: requests.Response) -> str:
@@ -568,13 +834,38 @@ def _normalized_text(resp: requests.Response) -> str:
         return resp.text or ""
 
     enc_candidates: List[str] = []
+    # Prefer in-document charset hints first; some upstream headers are stale.
+    meta_head = raw[:8192]
+    mm = re.search(
+        br"<meta[^>]+charset\s*=\s*['\"]?\s*([a-zA-Z0-9._-]+)",
+        meta_head,
+        flags=re.I,
+    )
+    if mm:
+        try:
+            enc_candidates.append(mm.group(1).decode("ascii", errors="ignore").strip().lower())
+        except Exception:
+            pass
+    mm = re.search(
+        br"<meta[^>]+content\s*=\s*['\"][^\"']*charset\s*=\s*([a-zA-Z0-9._-]+)",
+        meta_head,
+        flags=re.I,
+    )
+    if mm:
+        try:
+            enc_candidates.append(mm.group(1).decode("ascii", errors="ignore").strip().lower())
+        except Exception:
+            pass
+
+    # In practice RuTracker pages are UTF-8; keep it ahead of HTTP-level hints.
+    enc_candidates.append("utf-8")
     ctype = str((resp.headers or {}).get("Content-Type") or "")
     m = re.search(r"charset\s*=\s*([a-zA-Z0-9._-]+)", ctype, flags=re.I)
     if m:
         enc_candidates.append(m.group(1).strip().lower())
     if resp.encoding:
         enc_candidates.append(str(resp.encoding).strip().lower())
-    enc_candidates.extend(["utf-8", "cp1251", "windows-1251"])
+    enc_candidates.extend(["cp1251", "windows-1251"])
 
     seen: set[str] = set()
     uniq: List[str] = []
@@ -754,8 +1045,8 @@ class RutrackerService:
         self._initialized = True
 
         self.base_url = (base_url or settings.rutracker_base).rstrip("/")
-        self.pipeline_version = "rt-track-pipeline-2026-03-08-27"
-        self.debug_probe_version = "rt-debug-probe-2026-03-08-26"
+        self.pipeline_version = "rt-track-pipeline-2026-03-10-30"
+        self.debug_probe_version = "rt-debug-probe-2026-03-10-29"
         self.instance_id = uuid.uuid4().hex[:12]
         self.started_at_utc = datetime.utcnow().isoformat() + "Z"
 
@@ -1256,17 +1547,25 @@ class RutrackerService:
 
         if len(q_tokens) == 1:
             qt = q_tokens[0]
-            if _title_starts_with_single_token_artist(title_txt, qt):
-                return True
+            variants = _script_variants(qt)
+            for qv in variants:
+                if _title_starts_with_single_token_artist(title_txt, qv):
+                    return True
             return False
 
         matched = 0
         for qt in q_tokens:
-            if qt in title_norm:
-                matched += 1
-                continue
-            lim = 1 if len(qt) <= 7 else 2
-            if any(_edit_distance_within(qt, tt, lim) for tt in title_tokens if abs(len(tt) - len(qt)) <= lim):
+            variants = _script_variants(qt)
+            ok = False
+            for qv in variants:
+                if qv in title_norm:
+                    ok = True
+                    break
+                lim = 1 if len(qv) <= 7 else 2
+                if any(_edit_distance_within(qv, tt, lim) for tt in title_tokens if abs(len(tt) - len(qv)) <= lim):
+                    ok = True
+                    break
+            if ok:
                 matched += 1
 
         need = max(1, int(round(len(q_tokens) * 0.6)))
@@ -1988,6 +2287,8 @@ class RutrackerService:
         # --- track mode: aggressive precision/speed ---
         track_raw = (track or "").strip()
         track_core = _normalize_track_query(track_raw) if track_raw else ""
+        if _keep_raw_track_form(track_raw, track_core):
+            track_core = track_raw
         track = track_core or track_raw
         artist_base = _derive_artist_from_query(artist, track)
         cache_key = f"search3:track:{artist}:{only_lossless}:{track_raw}"
@@ -2032,6 +2333,15 @@ class RutrackerService:
             strict_artist_prefilter = 0
             skip_expensive_tail = False
             single_token_artist = len(_artist_tokens(artist_base)) == 1
+            raw_track_for_pass = track_raw or track
+            if (
+                strict_album_limit_nohit is not None
+                and only_lossless is False
+                and single_token_artist
+                and conf >= 0.90
+                and strict_album_limit_nohit < 2
+            ):
+                strict_album_limit_nohit = 2
 
             def _merge_more(more: List[TorrentInfo]) -> int:
                 seen = {x.url for x in items}
@@ -2344,12 +2654,40 @@ class RutrackerService:
                 and strict_artist_prefilter == 0
                 and (not do_album_passes)
             )
+            script_variant_queries = _build_script_variant_strict_queries(artist_base, track) if track else []
             if skip_expensive_tail:
                 log.debug(
                     "track no-hit gating enabled: strict_track_rows_total=%d strict_artist_prefilter=%d",
                     strict_track_rows_total,
                     strict_artist_prefilter,
                 )
+            if not items and script_variant_queries and time.time() < non_fallback_deadline:
+                script_budget = min(1.1, max(0.5, budget * 0.18))
+                script_deadline = min(non_fallback_deadline, time.time() + script_budget)
+                script_phase_budget = max(0.4, min(0.9, script_deadline - time.time()))
+                for sq in script_variant_queries:
+                    if time.time() >= script_deadline or len(items) >= want:
+                        break
+                    log.debug("track phase=script_variant_strict query=%r", sq)
+                    phase_t0 = time.time()
+                    script_more = self._get_current_account().cb.call(
+                        self._pass_once,
+                        sq,
+                        artist_base,
+                        only_lossless,
+                        track,
+                        [],
+                        phase_t0,
+                        script_phase_budget,
+                        want,
+                        1,
+                        min(14, self.track_max_candidates_per_pass),
+                        False,
+                        False,
+                        True,
+                        False,
+                    )
+                    _merge_more(script_more)
             if not items and typo_recovery_enabled and time.time() < non_fallback_deadline:
                 typo_budget = min(1.6, max(0.7, budget * 0.28))
                 typo_deadline = min(non_fallback_deadline, time.time() + typo_budget)
@@ -2380,12 +2718,16 @@ class RutrackerService:
             if (
                 not items
                 and track_raw
-                and _norm(track_raw) != _norm(track)
+                and (_norm(track_raw) != _norm(track) or single_token_artist)
                 and time.time() < non_fallback_deadline
             ):
                 raw_phase_budget = max(0.4, min(1.2, non_fallback_deadline - time.time()))
                 raw_phase_t0 = time.time()
-                for rq in (f'{artist_base} "{track_raw}"', f"{artist_base} {track_raw}"):
+                raw_queries: List[str] = [f'{artist_base} "{track_raw}"', f"{artist_base} {track_raw}"]
+                if single_token_artist:
+                    raw_queries.append(f'"{track_raw}"')
+                    raw_queries.append(track_raw)
+                for rq in raw_queries:
                     if len(items) >= want:
                         break
                     if time.time() >= non_fallback_deadline:
@@ -2396,7 +2738,7 @@ class RutrackerService:
                         rq,
                         artist_base,
                         only_lossless,
-                        track,
+                        raw_track_for_pass,
                         albums,
                         raw_phase_t0,
                         raw_phase_budget,
@@ -2407,8 +2749,38 @@ class RutrackerService:
                         False,
                         True,
                         True,
+                        min(8, self.track_max_candidates_per_pass),
                     )
                     _merge_more(raw_more)
+            if (
+                not items
+                and single_token_artist
+                and raw_track_for_pass
+                and only_lossless is False
+                and time.time() < non_fallback_deadline
+            ):
+                st_deadline = min(non_fallback_deadline, time.time() + 1.4)
+                st_budget = max(0.6, min(1.2, st_deadline - time.time()))
+                st_t0 = time.time()
+                st_more = self._get_current_account().cb.call(
+                    self._pass_once,
+                    artist_base,
+                    artist_base,
+                    only_lossless,
+                    raw_track_for_pass,
+                    albums,
+                    st_t0,
+                    st_budget,
+                    want,
+                    2,
+                    min(60, max(30, self.track_max_candidates_per_pass * 2)),
+                    False,
+                    True,
+                    True,
+                    True,
+                    min(20, self.track_max_candidates_per_pass),
+                )
+                _merge_more(st_more)
             if (
                 not items
                 and track
@@ -2865,6 +3237,8 @@ class RutrackerService:
                 want = max(1, self.want_results)
                 track_raw = (track or "").strip()
                 track_core = _normalize_track_query(track_raw) if track_raw else ""
+                if _keep_raw_track_form(track_raw, track_core):
+                    track_core = track_raw
                 track_effective = track_core or track_raw
                 track = track_effective
                 artist_base = _derive_artist_from_query(query, track_effective)
@@ -3152,6 +3526,14 @@ class RutrackerService:
                 strict_album_limit_nohit = self.track_strict_album_limit_nohit if do_album_passes else None
                 if strict_album_limit_nohit is not None and strict_album_limit_nohit < 2 and only_lossless is True:
                     strict_album_limit_nohit = 2
+                if (
+                    strict_album_limit_nohit is not None
+                    and only_lossless is False
+                    and single_token_artist
+                    and conf >= 0.90
+                    and strict_album_limit_nohit < 2
+                ):
+                    strict_album_limit_nohit = 2
                 cached_miss_recheck_top_n = min(14, max(10, self.track_max_candidates_per_pass))
                 resolver_payload["strict_album_limit_nohit_effective"] = strict_album_limit_nohit
                 resolver_payload["cached_miss_recheck_top_n"] = cached_miss_recheck_top_n
@@ -3170,9 +3552,11 @@ class RutrackerService:
                     and strict_artist_prefilter == 0
                     and (not do_album_passes)
                 )
+                script_variant_queries = _build_script_variant_strict_queries(artist_base, track) if track else []
                 resolver_payload["strict_track_rows_total"] = strict_track_rows_total
                 resolver_payload["strict_artist_prefilter"] = strict_artist_prefilter
                 resolver_payload["skip_expensive_tail"] = bool(skip_expensive_tail)
+                resolver_payload["script_variant_strict_enabled"] = bool(script_variant_queries)
                 resolver_payload["strict_deep_track_enabled"] = bool(
                     track and strict_track_rows_total >= 8 and _is_short_common_track(track) and only_lossless is not False
                 )
@@ -3185,6 +3569,29 @@ class RutrackerService:
                 resolver_payload["lossy_album_deep_enabled"] = bool(
                     track and only_lossless is False and do_album_passes
                 )
+                if not pipeline_items and script_variant_queries and time.time() < non_fallback_deadline:
+                    script_budget = min(1.1, max(0.5, budget * 0.18))
+                    script_deadline = min(non_fallback_deadline, time.time() + script_budget)
+                    script_phase_budget = max(0.4, min(0.9, script_deadline - time.time()))
+                    for sq in script_variant_queries:
+                        if time.time() >= script_deadline or len(pipeline_items) >= want:
+                            break
+                        _run_pass(
+                            "script_variant_strict",
+                            "script_variant_query",
+                            sq,
+                            False,
+                            False,
+                            only_lossless,
+                            album_hints_override=[],
+                            deadline=script_deadline,
+                            max_pages_override=1,
+                            max_candidates_override=min(14, self.track_max_candidates_per_pass),
+                            budget_override=script_phase_budget,
+                            soft_artist_match=True,
+                            fuzzy_track_match=False,
+                            call_t0_override=time.time(),
+                        )
                 if not pipeline_items and typo_recovery_enabled and time.time() < non_fallback_deadline:
                     typo_budget = min(1.6, max(0.7, budget * 0.28))
                     typo_deadline = min(non_fallback_deadline, time.time() + typo_budget)
@@ -3210,12 +3617,17 @@ class RutrackerService:
                 if (
                     not pipeline_items
                     and track_raw
-                    and _norm(track_raw) != _norm(track)
+                    and (_norm(track_raw) != _norm(track) or single_token_artist)
                     and time.time() < non_fallback_deadline
                 ):
                     raw_deadline = min(non_fallback_deadline, time.time() + 1.2)
                     raw_phase_budget = max(0.4, min(1.0, raw_deadline - time.time()))
-                    for rq in (f'{artist_base} "{track_raw}"', f"{artist_base} {track_raw}"):
+                    raw_track_for_pass = track_raw or track
+                    raw_queries: List[str] = [f'{artist_base} "{track_raw}"', f"{artist_base} {track_raw}"]
+                    if single_token_artist:
+                        raw_queries.append(f'"{track_raw}"')
+                        raw_queries.append(track_raw)
+                    for rq in raw_queries:
                         if time.time() >= raw_deadline or len(pipeline_items) >= want:
                             break
                         _run_pass(
@@ -3225,15 +3637,42 @@ class RutrackerService:
                             False,
                             False,
                             only_lossless,
-                            track_for_pass=track,
+                            track_for_pass=raw_track_for_pass,
                             deadline=raw_deadline,
                             max_pages_override=1,
                             max_candidates_override=min(12, self.track_max_candidates_per_pass),
                             budget_override=raw_phase_budget,
                             soft_artist_match=True,
                             fuzzy_track_match=True,
+                            recheck_cached_miss_top_n=min(8, self.track_max_candidates_per_pass),
                             call_t0_override=time.time(),
                         )
+                if (
+                    not pipeline_items
+                    and single_token_artist
+                    and raw_track_for_pass
+                    and only_lossless is False
+                    and time.time() < non_fallback_deadline
+                ):
+                    st_deadline = min(non_fallback_deadline, time.time() + 1.4)
+                    st_budget = max(0.6, min(1.2, st_deadline - time.time()))
+                    _run_pass(
+                        "single_token_deep_fallback",
+                        "single_token_artist_trackchecked",
+                        artist_base,
+                        False,
+                        True,
+                        only_lossless,
+                        track_for_pass=raw_track_for_pass,
+                        deadline=st_deadline,
+                        max_pages_override=2,
+                        max_candidates_override=min(60, max(30, self.track_max_candidates_per_pass * 2)),
+                        budget_override=st_budget,
+                        soft_artist_match=True,
+                        fuzzy_track_match=True,
+                        recheck_cached_miss_top_n=min(20, self.track_max_candidates_per_pass),
+                        call_t0_override=time.time(),
+                    )
                 if (
                     not pipeline_items
                     and track
@@ -3444,14 +3883,50 @@ class RutrackerService:
                             checks.append(c)
 
                 seen_tid: set[int] = set()
+                probe_limit = max(1, int(verify_top_n))
+
+                def _topic_id_from_url(url: str) -> int:
+                    m = re.search(r"[?&]t=(\d+)", str(url or ""))
+                    if not m:
+                        return 0
+                    try:
+                        return int(m.group(1))
+                    except Exception:
+                        return 0
+
+                # Prioritize final pipeline items in verification probe so
+                # verify_top_n window does not miss low-seed valid finals.
+                for ti in pipeline_items[: max(probe_limit, self.want_results)]:
+                    if len(track_probe) >= probe_limit:
+                        break
+                    tid = _topic_id_from_url(ti.url)
+                    if tid <= 0 or tid in seen_tid:
+                        continue
+                    seen_tid.add(tid)
+                    files = self._get_filelist_for_account(tid, account)
+                    hit, details = self._track_in_files(files, track, [])
+                    track_probe.append(
+                        {
+                            "topic_id": tid,
+                            "title": ti.title,
+                            "seeders": int(ti.seeders or 0),
+                            "file_count": len(files),
+                            "track_hit": bool(hit),
+                            "from_presence_cache": False,
+                            "details": details,
+                        }
+                    )
+
                 ranked_checks = sorted(
                     [c for c in checks if c.get("topic_id")],
                     key=lambda x: int(x.get("seeders") or 0),
                     reverse=True,
                 )
                 for c in ranked_checks:
+                    if len(track_probe) >= probe_limit:
+                        break
                     tid = int(c.get("topic_id"))
-                    if tid in seen_tid:
+                    if tid <= 0 or tid in seen_tid:
                         continue
                     seen_tid.add(tid)
                     track_probe.append(
@@ -3465,12 +3940,13 @@ class RutrackerService:
                             "details": c.get("details") or {},
                         }
                     )
-                    if len(track_probe) >= max(1, int(verify_top_n)):
-                        break
 
                 if not track_probe and filtered_rows:
-                    top = sorted(filtered_rows, key=lambda x: x[0].seeders, reverse=True)[: max(1, int(verify_top_n))]
+                    top = sorted(filtered_rows, key=lambda x: x[0].seeders, reverse=True)[:probe_limit]
                     for ti, tid, _, __, ___ in top:
+                        if tid in seen_tid:
+                            continue
+                        seen_tid.add(tid)
                         files = self._get_filelist_for_account(tid, account)
                         hit, details = self._track_in_files(files, track, [])
                         track_probe.append(
