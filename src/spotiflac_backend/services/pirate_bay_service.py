@@ -1,4 +1,4 @@
-import asyncio
+﻿import asyncio
 import base64
 import binascii
 import hashlib
@@ -42,7 +42,7 @@ from spotiflac_backend.models.torrent import TorrentInfo
 
 log = logging.getLogger(__name__)
 
-# Константы для фильтрации
+# РљРѕРЅСЃС‚Р°РЅС‚С‹ РґР»СЏ С„РёР»СЊС‚СЂР°С†РёРё
 _LOSSLESS_RE = re.compile(r"\b(flac|wavpack|wv|ape|alac|aiff|pcm|dts|mlp|tta|mqa|lossless)\b", re.IGNORECASE)
 _LOSSY_RE = re.compile(r"\b(mp3|aac|ogg|opus|lossy)\b", re.IGNORECASE)
 _BTIH_RE = re.compile(r"btih:([A-Za-z0-9]{32,40})", re.IGNORECASE)
@@ -50,7 +50,7 @@ _BTIH_RE = re.compile(r"btih:([A-Za-z0-9]{32,40})", re.IGNORECASE)
 
 @dataclass
 class PerformanceMetrics:
-    """Метрики производительности."""
+    """РњРµС‚СЂРёРєРё РїСЂРѕРёР·РІРѕРґРёС‚РµР»СЊРЅРѕСЃС‚Рё."""
     total_requests: int = 0
     cache_hits: int = 0
     api_calls: int = 0
@@ -58,7 +58,7 @@ class PerformanceMetrics:
 
 
 def _human_size(nbytes: int) -> str:
-    """Конвертирует байты в человекочитаемый формат."""
+    """РљРѕРЅРІРµСЂС‚РёСЂСѓРµС‚ Р±Р°Р№С‚С‹ РІ С‡РµР»РѕРІРµРєРѕС‡РёС‚Р°РµРјС‹Р№ С„РѕСЂРјР°С‚."""
     suffixes = ["B", "KB", "MB", "GB", "TB"]
     v = float(nbytes)
     for suf in suffixes:
@@ -69,7 +69,7 @@ def _human_size(nbytes: int) -> str:
 
 
 def _hex_upper_from_btih(btih: str) -> Optional[str]:
-    """Нормализует BTIH в верхний регистр HEX."""
+    """РќРѕСЂРјР°Р»РёР·СѓРµС‚ BTIH РІ РІРµСЂС…РЅРёР№ СЂРµРіРёСЃС‚СЂ HEX."""
     v = (btih or "").strip()
 
     if v.lower().startswith("urn:btih:"):
@@ -77,11 +77,11 @@ def _hex_upper_from_btih(btih: str) -> Optional[str]:
     if v.lower().startswith("urn:btmh:"):
         return None
 
-    # HEX формат (40 символов)
+    # HEX С„РѕСЂРјР°С‚ (40 СЃРёРјРІРѕР»РѕРІ)
     if len(v) == 40 and all(c in "0123456789abcdefABCDEF" for c in v):
         return v.upper()
 
-    # Base32 формат (32 символа)
+    # Base32 С„РѕСЂРјР°С‚ (32 СЃРёРјРІРѕР»Р°)
     if len(v) == 32:
         try:
             raw = base64.b32decode(v.upper())
@@ -93,13 +93,13 @@ def _hex_upper_from_btih(btih: str) -> Optional[str]:
 
 
 def _slug(s: str) -> str:
-    """Создает slug из строки для URL."""
+    """РЎРѕР·РґР°РµС‚ slug РёР· СЃС‚СЂРѕРєРё РґР»СЏ URL."""
     t = re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-")
     return t or "torrent"
 
 
 def _title_maybe_contains_track(title: str, track: str) -> bool:
-    """Быстрая проверка, может ли заголовок содержать трек."""
+    """Р‘С‹СЃС‚СЂР°СЏ РїСЂРѕРІРµСЂРєР°, РјРѕР¶РµС‚ Р»Рё Р·Р°РіРѕР»РѕРІРѕРє СЃРѕРґРµСЂР¶Р°С‚СЊ С‚СЂРµРє."""
     if not track:
         return True
     t = (title or "").lower()
@@ -145,10 +145,10 @@ def _dedupe_preserve_order(values: List[str]) -> List[str]:
 
 
 class FastHTTPSession:
-    """Быстрая HTTP сессия с минимальными настройками."""
+    """Р‘С‹СЃС‚СЂР°СЏ HTTP СЃРµСЃСЃРёСЏ СЃ РјРёРЅРёРјР°Р»СЊРЅС‹РјРё РЅР°СЃС‚СЂРѕР№РєР°РјРё."""
 
     def __init__(self):
-        # Простейшая конфигурация без конфликтов
+        # РџСЂРѕСЃС‚РµР№С€Р°СЏ РєРѕРЅС„РёРіСѓСЂР°С†РёСЏ Р±РµР· РєРѕРЅС„Р»РёРєС‚РѕРІ
         self.session: Optional[ClientSession] = None
 
     async def _ensure_session(self) -> ClientSession:
@@ -167,7 +167,7 @@ class FastHTTPSession:
         return self.session
 
     async def get_fast(self, url: str, timeout: float = 2.0) -> Optional[bytes]:
-        """Быстрый GET запрос."""
+        """Р‘С‹СЃС‚СЂС‹Р№ GET Р·Р°РїСЂРѕСЃ."""
         try:
             session = await self._ensure_session()
             custom_timeout = ClientTimeout(total=timeout)
@@ -175,7 +175,7 @@ class FastHTTPSession:
             async with session.get(url, timeout=custom_timeout, allow_redirects=False) as resp:
                 if resp.status == 200:
                     data = await resp.read()
-                    if len(data) > 50 * 1024 * 1024:  # Больше 50MB
+                    if len(data) > 50 * 1024 * 1024:  # Р‘РѕР»СЊС€Рµ 50MB
                         return None
                     return data
                 elif resp.status in (301, 302, 303, 307, 308):
@@ -201,7 +201,7 @@ class FastHTTPSession:
             timeout_connect: float = 3.0,
             timeout_read: float = 7.0,
     ) -> Optional[Any]:
-        """Быстрый GET для JSON API."""
+        """Р‘С‹СЃС‚СЂС‹Р№ GET РґР»СЏ JSON API."""
         try:
             session = await self._ensure_session()
             timeout = ClientTimeout(total=timeout_total, connect=timeout_connect, sock_read=timeout_read)
@@ -225,15 +225,23 @@ class FastHTTPSession:
 
 
 class SpeedyCache:
-    """Ультрабыстрый кеш."""
+    """РЈР»СЊС‚СЂР°Р±С‹СЃС‚СЂС‹Р№ РєРµС€."""
 
     def __init__(self, redis_pool: ConnectionPool):
         self.redis = Redis(connection_pool=redis_pool)
         self.memory: Dict[str, Tuple[Any, float]] = {}
         self.memory_lock = asyncio.Lock()
+        self.redis_write_block_until = 0.0
+        self._readonly_last_log_at = 0.0
+        self._readonly_backoff_sec = 300.0
+
+    @staticmethod
+    def _is_redis_readonly_error(exc: Exception) -> bool:
+        msg = str(exc or "").lower()
+        return ("read only replica" in msg) or ("readonly" in msg)
 
     async def get_fast(self, key: str, ttl: int = 300) -> Optional[Any]:
-        """Быстрое получение."""
+        """Р‘С‹СЃС‚СЂРѕРµ РїРѕР»СѓС‡РµРЅРёРµ."""
         # Memory cache
         now = time.time()
         if key in self.memory:
@@ -260,12 +268,12 @@ class SpeedyCache:
         return None
 
     async def set_fast(self, key: str, value: Any, ex: int):
-        """Быстрое сохранение."""
+        """Р‘С‹СЃС‚СЂРѕРµ СЃРѕС…СЂР°РЅРµРЅРёРµ."""
         await self.set_memory(key, value)
         asyncio.create_task(self._set_redis_async(key, value, ex))
 
     async def set_memory(self, key: str, value: Any):
-        """Установка в memory cache."""
+        """РЈСЃС‚Р°РЅРѕРІРєР° РІ memory cache."""
         async with self.memory_lock:
             if len(self.memory) > 2000:
                 cutoff = time.time() - 1800
@@ -277,20 +285,31 @@ class SpeedyCache:
             self.memory[key] = (value, time.time())
 
     async def _cleanup_memory_key(self, key: str):
-        """Асинхронная очистка memory key."""
+        """РђСЃРёРЅС…СЂРѕРЅРЅР°СЏ РѕС‡РёСЃС‚РєР° memory key."""
         async with self.memory_lock:
             self.memory.pop(key, None)
 
     async def _set_redis_async(self, key: str, value: Any, ex: int):
-        """Асинхронная установка в Redis."""
+        now = time.time()
+        if now < float(self.redis_write_block_until or 0.0):
+            return
         try:
             await self.redis.set(key, json.dumps(value), ex=ex)
         except Exception as e:
-            log.debug(f"Redis set error for {key}: {e}")
-
+            if self._is_redis_readonly_error(e):
+                self.redis_write_block_until = now + self._readonly_backoff_sec
+                if (now - float(self._readonly_last_log_at or 0.0)) >= 60.0:
+                    self._readonly_last_log_at = now
+                    log.warning(
+                        "PB cache Redis is READONLY. Disabling writes for %.0fs: %s",
+                        self._readonly_backoff_sec,
+                        e,
+                    )
+                return
+            log.debug("Redis set error for %s: %s", key, e)
 
 class PirateBayService:
-    """Быстрый сервис для работы с PirateBay API."""
+    """Р‘С‹СЃС‚СЂС‹Р№ СЃРµСЂРІРёСЃ РґР»СЏ СЂР°Р±РѕС‚С‹ СЃ PirateBay API."""
 
     _instance = None
     _lock = asyncio.Lock()
@@ -309,11 +328,11 @@ class PirateBayService:
             return
         self._initialized = True
 
-        # Базовые настройки
+        # Р‘Р°Р·РѕРІС‹Рµ РЅР°СЃС‚СЂРѕР№РєРё
         base = api_base_url or getattr(settings, "piratebay_api_base", "https://apibay.org")
         self.api_base = base.rstrip("/")
 
-        # HTTP сессия
+        # HTTP СЃРµСЃСЃРёСЏ
         self.http = FastHTTPSession()
 
         # Redis
@@ -325,10 +344,10 @@ class PirateBayService:
             decode_responses=True
         )
 
-        # Быстрый кеш
+        # Р‘С‹СЃС‚СЂС‹Р№ РєРµС€
         self.cache = SpeedyCache(self.redis_pool)
 
-        # Сокращенные TTL
+        # РЎРѕРєСЂР°С‰РµРЅРЅС‹Рµ TTL
         self.search_ttl = 180  # 3 minutes
         self.filelist_ttl = 3600  # 1 hour
         self.torrent_ttl = 7200  # 2 hours
@@ -393,20 +412,20 @@ class PirateBayService:
             "https://tpb.party/download/{ID}",
             "https://pirateproxy.live/download/{ID}",
         ]
-        # Трекеры
+        # РўСЂРµРєРµСЂС‹
         self._trackers = [
             "udp://tracker.opentrackr.org:1337/announce",
             "udp://open.stealth.si:80/announce",
             "udp://tracker.torrent.eu.org:451/announce",
         ]
 
-        # Метрики
+        # РњРµС‚СЂРёРєРё
         self.metrics = PerformanceMetrics()
 
         log.info(f"PirateBayService initialized: api={self.api_base}")
 
     async def _record_timing(self, operation: str, start_time: float):
-        """Записывает метрики."""
+        """Р—Р°РїРёСЃС‹РІР°РµС‚ РјРµС‚СЂРёРєРё."""
         duration = time.time() - start_time
         self.metrics.total_requests += 1
 
@@ -421,17 +440,17 @@ class PirateBayService:
             only_lossless: Optional[bool] = None,
             track: Optional[str] = None,
     ) -> List[TorrentInfo]:
-        """Быстрый поиск торрентов."""
+        """Р‘С‹СЃС‚СЂС‹Р№ РїРѕРёСЃРє С‚РѕСЂСЂРµРЅС‚РѕРІ."""
         start_time = time.time()
 
-        # Кеш
+        # РљРµС€
         cache_key = f"pb:search:{query}:{only_lossless}:{track}"
         if cached := await self.cache.get_fast(cache_key, ttl=self.search_ttl):
             self.metrics.cache_hits += 1
             await self._record_timing("search_cached", start_time)
             return [TorrentInfo(**d) for d in cached]
 
-        # API запрос
+        # API Р·Р°РїСЂРѕСЃ
         items, api_reachable = await self._search_api_items(query)
         page_reachable = False
         if not items:
@@ -444,10 +463,10 @@ class PirateBayService:
 
         self.metrics.api_calls += 1
 
-        # Обработка результатов
+        # РћР±СЂР°Р±РѕС‚РєР° СЂРµР·СѓР»СЊС‚Р°С‚РѕРІ
         results = await self._process_search_results(items, only_lossless, track)
 
-        # Кеш
+        # РљРµС€
         cache_data = [r.__dict__ for r in results]
         await self.cache.set_fast(cache_key, cache_data, ex=self.search_ttl)
 
@@ -669,9 +688,9 @@ class PirateBayService:
             only_lossless: Optional[bool],
             track: Optional[str]
     ) -> List[TorrentInfo]:
-        """Обработка результатов поиска."""
+        """РћР±СЂР°Р±РѕС‚РєР° СЂРµР·СѓР»СЊС‚Р°С‚РѕРІ РїРѕРёСЃРєР°."""
 
-        # Очистка
+        # РћС‡РёСЃС‚РєР°
         clean_items = []
         for it in items if isinstance(items, list) else []:
             if not isinstance(it, dict):
@@ -697,7 +716,7 @@ class PirateBayService:
                 await self.cache.set_fast(f"pb:id2hash:{tid}", ih_norm, ex=self.id2hash_ttl)
             clean_items.append(it)
 
-        # Lossless фильтрация
+        # Lossless С„РёР»СЊС‚СЂР°С†РёСЏ
         if only_lossless is not None:
             filtered = []
             for it in clean_items:
@@ -714,7 +733,7 @@ class PirateBayService:
         else:
             filtered = clean_items
 
-        # Track фильтрация
+        # Track С„РёР»СЊС‚СЂР°С†РёСЏ
         if track:
             def candidate_score(it: dict) -> tuple[int, int, int]:
                 name = it.get("name", "")
@@ -759,7 +778,7 @@ class PirateBayService:
                 else:
                     filtered = []
 
-        # Результаты
+        # Р РµР·СѓР»СЊС‚Р°С‚С‹
         results: List[TorrentInfo] = []
         for it in filtered:
             size_bytes = it.get("size", 0)
@@ -964,7 +983,7 @@ class PirateBayService:
         got = self._torrent_info_hash(data)
         return bool(got and got == expected_hash.upper())
     async def _extract_hash_fast(self, url: str) -> Optional[str]:
-        """Быстрое извлечение hash."""
+        """Р‘С‹СЃС‚СЂРѕРµ РёР·РІР»РµС‡РµРЅРёРµ hash."""
         if url.startswith("magnet:"):
             parsed = urlparse(url)
             qs = parse_qs(parsed.query)
@@ -1209,7 +1228,7 @@ class PirateBayService:
                 return data
         return None
     async def download_by_id(self, torrent_id: str) -> bytes:
-        """Скачивание по ID."""
+        """РЎРєР°С‡РёРІР°РЅРёРµ РїРѕ ID."""
         info_hash = await self._extract_hash_fast(f"https://thepiratebay.org/?t={torrent_id}")
         if not info_hash:
             raise HTTPException(status_code=404, detail="Torrent not found")
@@ -1238,7 +1257,7 @@ class PirateBayService:
         return await self.download(fake_info)
 
     async def download_by_hash(self, info_hash: str) -> bytes:
-        """Скачивание по hash."""
+        """РЎРєР°С‡РёРІР°РЅРёРµ РїРѕ hash."""
         ih = _hex_upper_from_btih(info_hash)
         if not ih:
             raise HTTPException(status_code=422, detail="Invalid hash format")
@@ -1376,7 +1395,7 @@ class PirateBayService:
         return report
 
     def get_performance_stats(self) -> Dict[str, Any]:
-        """Статистика производительности."""
+        """РЎС‚Р°С‚РёСЃС‚РёРєР° РїСЂРѕРёР·РІРѕРґРёС‚РµР»СЊРЅРѕСЃС‚Рё."""
         total = self.metrics.total_requests
         cache_rate = (self.metrics.cache_hits / total * 100) if total > 0 else 0
 
@@ -1388,7 +1407,7 @@ class PirateBayService:
         }
 
     async def clear_cache(self, pattern: str = "pb:*"):
-        """Очистка кеша."""
+        """РћС‡РёСЃС‚РєР° РєРµС€Р°."""
         try:
             redis = Redis(connection_pool=self.redis_pool)
             keys = await redis.keys(pattern)
@@ -1399,14 +1418,14 @@ class PirateBayService:
             log.error(f"Cache clear error: {e}")
 
     async def close(self) -> None:
-        """Закрытие сервиса."""
+        """Р—Р°РєСЂС‹С‚РёРµ СЃРµСЂРІРёСЃР°."""
         await self.http.close()
         log.info("PirateBayService closed")
 
 
 @lru_cache()
 def get_piratebay_service() -> PirateBayService:
-    """Возвращает singleton экземпляр сервиса."""
+    """Р’РѕР·РІСЂР°С‰Р°РµС‚ singleton СЌРєР·РµРјРїР»СЏСЂ СЃРµСЂРІРёСЃР°."""
     return PirateBayService()
 
 

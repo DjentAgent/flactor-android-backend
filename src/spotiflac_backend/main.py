@@ -7,12 +7,15 @@ import os
 os.environ.setdefault("REDIS_DISABLE_HIREDIS", "1")
 
 import logging
+import re
 import sys
 import time
 import asyncio
 import socket
+from pathlib import Path
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Optional
+from importlib.metadata import PackageNotFoundError, version as pkg_version
 
 try:
     import uvloop  # type: ignore
@@ -53,6 +56,33 @@ except Exception:
         from redis._parsers import PythonParser as RedisPythonParser
     except Exception:
         RedisPythonParser: Optional[type] = None
+
+
+def _resolve_app_version() -> str:
+    env_version = (os.getenv("APP_VERSION") or "").strip()
+    if env_version:
+        return env_version
+
+    try:
+        return pkg_version("spotiflac-backend")
+    except PackageNotFoundError:
+        pass
+    except Exception:
+        pass
+
+    try:
+        pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+        text = pyproject.read_text(encoding="utf-8")
+        m = re.search(r'^\s*version\s*=\s*"([^"]+)"\s*$', text, flags=re.MULTILINE)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+
+    return "unknown"
+
+
+APP_VERSION = _resolve_app_version()
 
 
 # ========================= Logging Configuration =========================
@@ -323,7 +353,7 @@ class RedisManager:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logging.info("Starting SpotiFlac Backend...")
+    logging.info("Starting SpotiFlac Backend v%s...", APP_VERSION)
     try:
         logging.info("Initializing Redis connections...")
         redis_client, cache_client = await RedisManager.initialize()
@@ -433,7 +463,7 @@ def create_application() -> FastAPI:
     app = FastAPI(
         title="SpotiFlac Backend",
         description="High-performance torrent search and download API",
-        version="2.0.0",
+        version=APP_VERSION,
         docs_url="/api/docs",
         redoc_url="/api/redoc",
         openapi_url="/api/openapi.json",
@@ -508,7 +538,7 @@ def create_application() -> FastAPI:
     async def root():
         return {
             "name": "SpotiFlac Backend",
-            "version": "2.0.0",
+            "version": APP_VERSION,
             "status": "running",
             "docs": "/api/docs"
         }

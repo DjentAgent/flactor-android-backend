@@ -1056,6 +1056,9 @@ class RutrackerService:
                 self.redis = self._build_redis_client()
             except Exception as e:
                 log.warning("Redis unavailable for RutrackerService, using in-memory store: %s", e)
+        self._redis_write_block_until = 0.0
+        self._redis_readonly_last_log_at = 0.0
+        self._redis_write_backoff_sec = 300.0
         self.cookie_ttl = DEFAULT_COOKIE_TTL
         self.search_ttl = DEFAULT_SEARCH_TTL
         self.filelist_ttl = DEFAULT_FILELIST_TTL
@@ -1283,6 +1286,51 @@ class RutrackerService:
                     time.sleep(delay)
         raise RuntimeError(f"RuTracker redis unavailable after {attempts} attempts")
 
+    def _is_redis_readonly_error(self, exc: Exception) -> bool:
+        msg = str(exc or "").lower()
+        return ("read only replica" in msg) or ("readonly" in msg)
+
+    def _redis_writes_allowed(self) -> bool:
+        return time.time() >= float(self._redis_write_block_until or 0.0)
+
+    def _mark_redis_readonly(self, exc: Exception, context: str) -> None:
+        now = time.time()
+        self._redis_write_block_until = now + self._redis_write_backoff_sec
+        if (now - float(self._redis_readonly_last_log_at or 0.0)) >= 60.0:
+            self._redis_readonly_last_log_at = now
+            log.warning(
+                "Redis is READONLY (%s). Disabling writes for %.0fs: %s",
+                context,
+                self._redis_write_backoff_sec,
+                exc,
+            )
+
+    def _safe_redis_set(self, key: str, value: str, ex: Optional[int] = None, context: str = "set") -> bool:
+        if not self._redis_writes_allowed():
+            return False
+        try:
+            self.redis.set(key, value, ex=ex)
+            return True
+        except Exception as e:
+            if self._is_redis_readonly_error(e):
+                self._mark_redis_readonly(e, context)
+                return False
+            log.debug("Redis set failed (%s): %s", context, e)
+            return False
+
+    def _safe_redis_delete(self, key: str, context: str = "delete") -> bool:
+        if not self._redis_writes_allowed():
+            return False
+        try:
+            self.redis.delete(key)
+            return True
+        except Exception as e:
+            if self._is_redis_readonly_error(e):
+                self._mark_redis_readonly(e, context)
+                return False
+            log.debug("Redis delete failed (%s): %s", context, e)
+            return False
+
     # -------- session / token helpers ----------
     def _extract_token(self, html: str) -> str:
         m = _FORM_TOKEN_RE.search(html)
@@ -1316,7 +1364,12 @@ class RutrackerService:
         r2.raise_for_status()
         if not acc.scraper.cookies.get("bb_session"):
             self._handle_login_captcha()
-        self.redis.set(acc.cookie_key, json.dumps(acc.scraper.cookies.get_dict()), ex=self.cookie_ttl)
+        self._safe_redis_set(
+            acc.cookie_key,
+            json.dumps(acc.scraper.cookies.get_dict()),
+            ex=self.cookie_ttl,
+            context="login_cookie_save",
+        )
         acc.last_keepalive_at = time.time()
         self._mark_account_success(acc)
         log.debug("Login succeeded account[%d]=%s bb_session=%s", acc.index, acc.login, acc.scraper.cookies.get("bb_session"))
@@ -1357,13 +1410,19 @@ class RutrackerService:
                 r = acc.scraper.get(url, params={"nm": "flac"}, allow_redirects=False, timeout=12)
             if r.status_code in (301, 302) and "login.php" in (r.headers.get("Location") or ""):
                 acc.scraper.cookies.clear()
-                self.redis.delete(acc.cookie_key)
+                self._safe_redis_delete(acc.cookie_key, context="keepalive_clear_cookie_redirect")
                 return
             if self._is_login_page(r.text):
                 acc.scraper.cookies.clear()
-                self.redis.delete(acc.cookie_key)
+                self._safe_redis_delete(acc.cookie_key, context="keepalive_clear_cookie_login_page")
                 return
-            self.redis.set(acc.cookie_key, json.dumps(acc.scraper.cookies.get_dict()), ex=self.cookie_ttl)
+            self._safe_redis_set(
+                acc.cookie_key,
+                json.dumps(acc.scraper.cookies.get_dict()),
+                ex=self.cookie_ttl,
+                context="keepalive_cookie_save",
+            )
+            # Keepalive succeeded even if Redis is readonly; avoid retry storm.
             acc.last_keepalive_at = now
         except Exception as e:
             log.debug("Keepalive failed account[%d]=%s: %s", acc.index, acc.login, e)
@@ -1380,7 +1439,7 @@ class RutrackerService:
 
         if r.status_code in (301, 302) and "login.php" in (r.headers.get("Location") or ""):
             acc.scraper.cookies.clear()
-            self.redis.delete(acc.cookie_key)
+            self._safe_redis_delete(acc.cookie_key, context="search_request_redirect_clear_cookie")
             self._login_sync()
             with acc.lock:
                 r = acc.scraper.get(url, params=params, timeout=25) if data is None else acc.scraper.post(
@@ -1394,7 +1453,7 @@ class RutrackerService:
         r.raise_for_status()
         if self._is_login_page(_normalized_text(r)):
             acc.scraper.cookies.clear()
-            self.redis.delete(acc.cookie_key)
+            self._safe_redis_delete(acc.cookie_key, context="search_request_login_page_clear_cookie")
             self._login_sync()
             with acc.lock:
                 r = acc.scraper.get(url, params=params, timeout=25) if data is None else acc.scraper.post(
@@ -1415,7 +1474,7 @@ class RutrackerService:
 
     def _cache_set_json(self, key: str, obj: Any, ttl: int):
         try:
-            self.redis.set(key, json.dumps(obj), ex=ttl)
+            self._safe_redis_set(key, json.dumps(obj), ex=ttl, context="cache_set_json")
         except Exception:
             pass
 
@@ -1439,7 +1498,12 @@ class RutrackerService:
         try:
             if ttl is None:
                 ttl = self.track_presence_ttl_hit_sec if present else self.track_presence_ttl_miss_sec
-            self.redis.set(self._has_track_cache_key(tid, track), "1" if present else "0", ex=int(ttl))
+            self._safe_redis_set(
+                self._has_track_cache_key(tid, track),
+                "1" if present else "0",
+                ex=int(ttl),
+                context="track_presence_set",
+            )
         except Exception:
             pass
 
@@ -4175,7 +4239,7 @@ class RutrackerService:
     def force_session_refresh(self):
         for acc in self.accounts:
             acc.scraper.cookies.clear()
-            self.redis.delete(acc.cookie_key)
+            self._safe_redis_delete(acc.cookie_key, context="force_session_refresh")
         log.info("All RuTracker sessions cleared; will re-login on next request")
 
     async def close(self):
